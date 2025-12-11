@@ -20,11 +20,69 @@ interface Group {
   id: string;
   name: string;
   members: number;
-  lastMessage: string;
+  lastMessageIcon?: string;
+  lastMessageText: string;
   unread: number;
   icon: string;
   avatarUrl?: string;
 }
+
+// Helper function to get message preview icon and text (matching ChatListScreen style)
+const getMessagePreview = (message: any): { icon?: string; text: string } => {
+  if (!message) return { text: 'No messages yet' };
+
+  const content = message.content || '';
+  const type = message.type || message.message_type || message.messageType || '';
+
+  // Helper to detect contact JSON in content
+  const detectContactFromContent = (contentStr: string): { icon: string; text: string } | null => {
+    if (typeof contentStr === 'string' && contentStr.trim().startsWith('{')) {
+      try {
+        const parsed = JSON.parse(contentStr);
+        // Check if it looks like a contact (has name and phone properties)
+        if (parsed.name && (parsed.phone || parsed.phoneNumber)) {
+          return { icon: 'person-outline', text: parsed.name };
+        }
+      } catch {
+        // Not valid JSON
+      }
+    }
+    return null;
+  };
+
+  switch (type.toUpperCase()) {
+    case 'CONTACT':
+      try {
+        const contactData = typeof content === 'string' ? JSON.parse(content) : content;
+        return { icon: 'person-outline', text: contactData.name || 'Contact' };
+      } catch {
+        return { icon: 'person-outline', text: 'Contact' };
+      }
+    case 'IMAGE':
+      return { icon: 'image-outline', text: 'Photo' };
+    case 'VIDEO':
+      return { icon: 'videocam-outline', text: 'Video' };
+    case 'AUDIO':
+    case 'VOICE':
+      return { icon: 'mic-outline', text: 'Audio' };
+    case 'DOCUMENT':
+      try {
+        const docData = typeof content === 'string' ? JSON.parse(content) : content;
+        return { icon: 'document-outline', text: docData.name || 'Document' };
+      } catch {
+        return { icon: 'document-outline', text: 'Document' };
+      }
+    case 'LOCATION':
+      return { icon: 'location-outline', text: 'Location' };
+    default:
+      // If type is TEXT or unknown, check if content looks like contact JSON
+      const contactDetected = detectContactFromContent(content);
+      if (contactDetected) {
+        return contactDetected;
+      }
+      return { text: content || 'No messages yet' };
+  }
+};
 
 const GroupsScreen = () => {
   const { theme } = useTheme();
@@ -46,24 +104,32 @@ const GroupsScreen = () => {
       const response = await conversationService.getConversations(100, 0);
 
       if (response.success && response.data) {
-        // Filter only group conversations
-        const groupConversations = response.data.conversations.filter(
+        // Filter only group conversations - handle both array and object with conversations property
+        const conversationsArray = Array.isArray(response.data)
+          ? response.data
+          : response.data.conversations || [];
+
+        const groupConversations = conversationsArray.filter(
           (conv: any) => conv.type === 'GROUP'
         );
 
-        const formattedGroups: Group[] = groupConversations.map((conv: any) => ({
-          id: conv.id,
-          name: conv.name || 'Unnamed Group',
-          members: conv.participant_count || 0,
-          lastMessage: conv.last_message?.content || 'No messages yet',
-          unread: conv.unread_count || 0,
-          icon: 'people',
-          avatarUrl: conv.avatar_url,
-        }));
+        const formattedGroups: Group[] = groupConversations.map((conv: any) => {
+          const preview = getMessagePreview(conv.lastMessage || conv.last_message);
+          return {
+            id: conv.id,
+            name: conv.name || 'Unnamed Group',
+            members: conv.participantCount || conv.participant_count || conv.participants?.length || 0,
+            lastMessageIcon: preview.icon,
+            lastMessageText: preview.text,
+            unread: conv.unreadCount || conv.unread_count || 0,
+            icon: 'people',
+            avatarUrl: conv.avatarUrl || conv.avatar_url,
+          };
+        });
 
         setGroups(formattedGroups);
       } else {
-        Alert.alert('Error', response.message || 'Failed to load groups');
+        setGroups([]);
       }
     } catch (error) {
       console.error('Load groups error:', error);
@@ -80,7 +146,7 @@ const GroupsScreen = () => {
   };
 
   const filteredGroups = groups.filter(group =>
-    group.name.toLowerCase().includes(searchQuery.toLowerCase())
+    (group.name || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
 
   const handleCreateGroup = () => {
@@ -220,11 +286,11 @@ const GroupsScreen = () => {
                     {group.avatarUrl ? (
                       <View style={styles.groupAvatarPlaceholder}>
                         <Text style={styles.groupAvatarText}>
-                          {group.name.charAt(0).toUpperCase()}
+                          {(group.name || 'G').charAt(0).toUpperCase()}
                         </Text>
                       </View>
                     ) : (
-                      <Icon name={group.icon} size={24} color="#FFFFFF" />
+                      <Icon name={group.icon || 'people'} size={24} color="#FFFFFF" />
                     )}
                   </View>
 
@@ -244,12 +310,22 @@ const GroupsScreen = () => {
                     <Text style={[styles.groupMembers, { color: theme.textSecondary }]}>
                       {group.members} {group.members === 1 ? 'member' : 'members'}
                     </Text>
-                    <Text
-                      style={[styles.lastMessage, { color: theme.textSecondary }]}
-                      numberOfLines={1}
-                    >
-                      {group.lastMessage}
-                    </Text>
+                    <View style={styles.lastMessageContainer}>
+                      {group.lastMessageIcon && (
+                        <Icon
+                          name={group.lastMessageIcon}
+                          size={14}
+                          color={theme.textSecondary}
+                          style={styles.lastMessageIcon}
+                        />
+                      )}
+                      <Text
+                        style={[styles.lastMessage, { color: theme.textSecondary }]}
+                        numberOfLines={1}
+                      >
+                        {group.lastMessageText}
+                      </Text>
+                    </View>
                   </View>
 
                   <Icon name="chevron-forward" size={20} color={theme.textTertiary} />
@@ -429,9 +505,17 @@ const styles = StyleSheet.create({
     marginBottom: 4,
     fontWeight: '500',
   },
+  lastMessageContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  lastMessageIcon: {
+    marginRight: 4,
+  },
   lastMessage: {
     fontSize: 14,
     fontWeight: '400',
+    flex: 1,
   },
   fab: {
     position: 'absolute',

@@ -37,9 +37,12 @@ export const SocketProvider: React.FC<SocketProviderProps> = ({ children }) => {
   const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {
+    console.log('[SocketContext] Auth state changed - isAuthenticated:', isAuthenticated, 'user:', !!user);
     if (isAuthenticated && user) {
+      console.log('[SocketContext] User is authenticated, initiating socket connection...');
       connectSocket();
     } else {
+      console.log('[SocketContext] User not authenticated, disconnecting socket...');
       disconnectSocket();
     }
 
@@ -50,11 +53,12 @@ export const SocketProvider: React.FC<SocketProviderProps> = ({ children }) => {
 
   const connectSocket = async () => {
     try {
+      console.log('[SocketContext] Calling socketService.connect()...');
       await socketService.connect();
       setIsConnected(true);
-      console.log('Socket connected successfully');
+      console.log('[SocketContext] Socket connected successfully, isConnected set to true');
     } catch (error) {
-      console.error('Failed to connect socket:', error);
+      console.error('[SocketContext] Failed to connect socket:', error);
       setIsConnected(false);
     }
   };

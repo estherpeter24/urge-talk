@@ -92,16 +92,16 @@ const VerificationScreen = ({ route, navigation }: Props) => {
         throw new Error('Invalid verification code format');
       }
 
+      // Validate phone number is available
+      if (!phoneNumber || typeof phoneNumber !== 'string') {
+        throw new Error('Phone number is missing. Please go back and try again.');
+      }
+
       if (mode === 'login') {
-        // For existing users (login), use AuthContext's verifyPhone
-        try {
-          await verifyPhoneAuth(phoneNumber, verificationCode);
-          showSuccess('Success', 'Welcome back!');
-          // AuthContext will automatically trigger navigation based on isAuthenticated state
-        } catch (error: any) {
-          // If verify-phone fails, it means user doesn't exist yet
-          throw new Error('Account not found. Please complete registration first.');
-        }
+        // For existing users (login), use AuthContext's verifyPhone (which uses login endpoint)
+        await verifyPhoneAuth(phoneNumber, verificationCode);
+        showSuccess('Success', 'Welcome back!');
+        // AuthContext will automatically trigger navigation based on isAuthenticated state
       } else {
         // For new users (registration), navigate to Welcome screen to complete registration
         navigation.navigate('Welcome', { phoneNumber, verificationCode });

@@ -10,6 +10,7 @@ import {
   Animated,
   ScrollView,
   SafeAreaView,
+  ActivityIndicator,
 } from 'react-native';
 import LinearGradient from 'react-native-linear-gradient';
 import Icon from 'react-native-vector-icons/Ionicons';
@@ -64,28 +65,23 @@ const WelcomeScreen = ({ route, navigation }: Props) => {
     setLoading(true);
 
     try {
-      // Register the user with a default password (user can change later)
-      const defaultPassword = 'Welcome123!';
-
-      // First, register the user
-      const authResponse = await authService.register({
+      // Register the user with phone verification (no password needed)
+      await authService.register({
         phoneNumber,
-        password: defaultPassword,
         displayName: name,
       });
 
-      // Then verify the phone with the verification code (if provided)
+      // Verify the phone with the verification code
       if (verificationCode) {
         try {
           await authService.verifyPhone(phoneNumber, verificationCode);
         } catch (verifyError) {
-          // If verification fails, that's okay - user is still registered
           console.warn('Phone verification failed:', verifyError);
         }
       }
 
-      // Login with the auth response
-      await login({ phoneNumber, password: defaultPassword });
+      // Login with phone number only (verification-based auth)
+      await login({ phoneNumber, verificationCode });
     } catch (error: any) {
       console.error('Registration error:', error);
       showError('Registration Failed', error.message || 'Failed to complete registration. Please try again.');
@@ -190,18 +186,27 @@ const WelcomeScreen = ({ route, navigation }: Props) => {
                 </View>
 
                 {/* Get Started Button */}
-                {isFormValid && (
-                  <TouchableOpacity
-                    style={[styles.getStartedButton, { backgroundColor: theme.primary }]}
-                    onPress={handleGetStarted}
-                    activeOpacity={0.8}
-                  >
-                    <View style={styles.buttonContent}>
-                      <Text style={[styles.buttonText, { color: '#FFFFFF' }]}>Get Started</Text>
-                      <Icon name="rocket" size={24} color="#FFFFFF" />
-                    </View>
-                  </TouchableOpacity>
-                )}
+                <TouchableOpacity
+                  style={[
+                    styles.getStartedButton,
+                    { backgroundColor: theme.primary },
+                    (!isFormValid || loading) && styles.buttonDisabled
+                  ]}
+                  onPress={handleGetStarted}
+                  activeOpacity={0.8}
+                  disabled={!isFormValid || loading}
+                >
+                  <View style={styles.buttonContent}>
+                    {loading ? (
+                      <ActivityIndicator color="#FFFFFF" />
+                    ) : (
+                      <>
+                        <Text style={[styles.buttonText, { color: '#FFFFFF' }]}>Get Started</Text>
+                        <Icon name="rocket" size={24} color="#FFFFFF" />
+                      </>
+                    )}
+                  </View>
+                </TouchableOpacity>
               </View>
             </Animated.View>
 
@@ -352,6 +357,11 @@ const styles = StyleSheet.create({
   featureText: {
     fontSize: 14,
     fontWeight: '600',
+  },
+  errorText: {
+    fontSize: 12,
+    marginTop: 6,
+    marginLeft: 4,
   },
 });
 

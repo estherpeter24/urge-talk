@@ -21,6 +21,7 @@ import { Theme } from '../../constants/theme';
 import { useTheme } from '../../context/ThemeContext';
 import { useModal } from '../../context/ModalContext';
 import { authService } from '../../services/api/authService';
+import { validatePhoneNumber, getPhoneValidationError } from '../../utils/validators';
 
 const { width, height } = Dimensions.get('window');
 
@@ -72,8 +73,10 @@ const RegisterScreen = () => {
   }, []);
 
   const handleContinue = async () => {
-    if (phoneNumber.trim().length < 10) {
-      showError('Invalid Input', 'Please enter a valid phone number');
+    const trimmedPhone = phoneNumber.trim();
+    const phoneError = getPhoneValidationError(trimmedPhone);
+    if (phoneError) {
+      showError('Invalid Input', phoneError);
       return;
     }
 
@@ -81,10 +84,10 @@ const RegisterScreen = () => {
 
     try {
       // Send verification code to phone number
-      await authService.sendVerificationCode(phoneNumber);
+      await authService.sendVerificationCode(trimmedPhone);
 
       // Navigate to Verification screen
-      navigation.navigate('Verification', { phoneNumber });
+      navigation.navigate('Verification', { phoneNumber: trimmedPhone });
     } catch (error: any) {
       console.error('Send code error:', error);
       showError('Error', error.message || 'Failed to send verification code. Please try again.');
@@ -98,7 +101,7 @@ const RegisterScreen = () => {
     outputRange: [1, 1.1, 1],
   });
 
-  const isValid = phoneNumber.trim().length >= 1;
+  const isValid = validatePhoneNumber(phoneNumber);
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>

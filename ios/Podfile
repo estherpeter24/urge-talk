@@ -14,8 +14,17 @@ if linkage != nil
   use_frameworks! :linkage => linkage.to_sym
 end
 
+# Enable modular headers for Firebase dependencies
+pod 'GoogleUtilities', :modular_headers => true
+pod 'FirebaseCore', :modular_headers => true
+pod 'FirebaseCoreInternal', :modular_headers => true
+pod 'FirebaseMessaging', :modular_headers => true
+
 target 'URGE' do
   config = use_native_modules!
+
+  # Enable Google Maps for react-native-maps
+  pod 'react-native-maps', :path => '../node_modules/react-native-maps', :subspecs => ['Google']
 
   use_react_native!(
     :path => config[:reactNativePath],

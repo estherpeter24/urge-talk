@@ -32,9 +32,10 @@ import Contacts from 'react-native-contacts';
 import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
 import { useSocket } from '../../context/SocketContext';
-import { ChatStackParamList, Message, Conversation, SocketEvent } from '../../types';
+import { useModal } from '../../context/ModalContext';
+import { ChatStackParamList, Message, Conversation, SocketEvent, MessageType, MessageStatus } from '../../types';
 import { Theme } from '../../constants/theme';
-import { conversationService, messageService, mediaService } from '../../services/api';
+import { conversationService, messageService, mediaService, settingsService } from '../../services/api';
 import AttachmentModal from '../../components/chat/AttachmentModal';
 import DocumentMenuModal from '../../components/chat/DocumentMenuModal';
 import LocationModal from '../../components/chat/LocationModal';
@@ -69,15 +70,16 @@ const POPULAR_EMOJIS = [
 type Props = NativeStackScreenProps<ChatStackParamList, 'ChatRoom'>;
 
 const ChatRoomScreen = ({ route, navigation }: Props) => {
-  const { conversationId, recipientName } = route.params;
+  const { conversationId, recipientName, recipientPhone: routeRecipientPhone } = route.params;
   const { user } = useAuth();
   const { theme } = useTheme();
   const socket = useSocket();
+  const { showModal, showSuccess, showError, showWarning, showConfirm } = useModal();
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(true);
   const [inputText, setInputText] = useState('');
-  const [recipientPhone, setRecipientPhone] = useState('');
+  const [recipientPhone, setRecipientPhone] = useState(routeRecipientPhone || '');
   const [recipientStatus, setRecipientStatus] = useState('');
   const [showAttachmentMenu, setShowAttachmentMenu] = useState(false);
   const [showDocumentMenu, setShowDocumentMenu] = useState(false);
@@ -103,6 +105,18 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
   const [showMessageInfoModal, setShowMessageInfoModal] = useState(false);
   const [messageForInfo, setMessageForInfo] = useState<Message | null>(null);
   const [uploadingMedia, setUploadingMedia] = useState(false);
+  const [showChatOptionsMenu, setShowChatOptionsMenu] = useState(false);
+
+  // Block status state
+  const [isBlocked, setIsBlocked] = useState(false);
+  const [iBlockedThem, setIBlockedThem] = useState(false);
+  const [theyBlockedMe, setTheyBlockedMe] = useState(false);
+  const [recipientUserId, setRecipientUserId] = useState<string | null>(null);
+
+  // Image preview state
+  const [showImagePreview, setShowImagePreview] = useState(false);
+  const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
+  const [previewImageCaption, setPreviewImageCaption] = useState<string>('');
   const [uploadProgress, setUploadProgress] = useState(0);
 
   // Voice recording states
@@ -117,7 +131,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
   const [audioDuration, setAudioDuration] = useState<{ [key: string]: number }>({});
 
   const flatListRef = useRef<FlatList>(null);
-  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioRecorderPlayer = useRef(new AudioRecorderPlayer()).current;
   const recordingPath = useRef<string>('');
   const waveformAnims = useRef(
@@ -157,18 +171,26 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
 
         setDeviceContacts(formattedContacts);
       } else {
-        Alert.alert(
-          'Permission Required',
-          'Please allow contacts access to share contacts',
-          [
-            { text: 'Cancel', style: 'cancel' },
-            { text: 'Settings', onPress: () => Linking.openSettings() },
-          ]
-        );
+        showModal({
+          type: 'warning',
+          title: 'Permission Required',
+          message: 'Please allow contacts access to share contacts',
+          icon: 'people',
+          primaryButton: {
+            text: 'Settings',
+            onPress: () => Linking.openSettings(),
+            variant: 'primary',
+          },
+          secondaryButton: {
+            text: 'Cancel',
+            onPress: () => {},
+            variant: 'secondary',
+          },
+        });
       }
     } catch (error) {
       console.error('Failed to load contacts:', error);
-      Alert.alert('Error', 'Failed to load contacts');
+      showError('Error', 'Failed to load contacts');
     }
   };
 
@@ -177,6 +199,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
     useCallback(() => {
       loadMessages();
       markConversationAsRead();
+      getRecipientUserId();
     }, [conversationId])
   );
 
@@ -190,29 +213,69 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
     socket.joinConversation(conversationId);
 
     // Handle new message received
-    const handleMessageReceived = (message: Message) => {
-      if (message.conversationId === conversationId) {
-        setMessages(prev => [...prev, message]);
+    const handleMessageReceived = (message: any) => {
+      console.log('[ChatRoom] Received message via WebSocket:', JSON.stringify(message));
+      console.log('[ChatRoom] Current user ID:', user?.id);
+      console.log('[ChatRoom] Message sender ID:', message.senderId || message.sender_id);
+      console.log('[ChatRoom] Message conversation ID:', message.conversationId || message.conversation_id);
+      console.log('[ChatRoom] Current conversation ID:', conversationId);
+
+      const msgConversationId = message.conversationId || message.conversation_id;
+      const msgSenderId = message.senderId || message.sender_id;
+
+      if (msgConversationId === conversationId) {
+        // Skip messages from the current user - they're already added optimistically
+        if (msgSenderId === user?.id) {
+          console.log('[ChatRoom] Skipping own message');
+          return;
+        }
+        setMessages(prev => {
+          // Also check if message already exists (by ID) to prevent duplicates
+          if (prev.some(m => m.id === message.id)) {
+            console.log('[ChatRoom] Message already exists, skipping');
+            return prev;
+          }
+          console.log('[ChatRoom] Adding new message to state');
+          // Normalize the message format
+          const normalizedMessage: Message = {
+            id: message.id,
+            conversationId: msgConversationId,
+            senderId: msgSenderId,
+            senderName: message.senderName || message.sender_name || 'Unknown',
+            content: message.content || '',
+            type: (message.messageType || message.message_type || MessageType.TEXT) as MessageType,
+            status: (message.status || MessageStatus.SENT) as MessageStatus,
+            isEncrypted: message.isEncrypted || message.is_encrypted || false,
+            createdAt: new Date(message.createdAt || message.created_at),
+            updatedAt: new Date(message.updatedAt || message.updated_at),
+            mediaUrl: message.mediaUrl || message.media_url,
+            replyTo: message.replyTo || message.reply_to,
+            isForwarded: message.isForwarded || message.is_forwarded || false,
+          };
+          return [...prev, normalizedMessage];
+        });
         // Mark as read if we're viewing the conversation
         socket.markMessageRead(message.id, conversationId);
         // Scroll to bottom
         setTimeout(() => {
           flatListRef.current?.scrollToEnd({ animated: true });
         }, 100);
+      } else {
+        console.log('[ChatRoom] Message is for different conversation, ignoring');
       }
     };
 
     // Handle message delivered status
     const handleMessageDelivered = (messageId: string) => {
       setMessages(prev => prev.map(msg =>
-        msg.id === messageId ? { ...msg, status: 'DELIVERED' } : msg
+        msg.id === messageId ? { ...msg, status: MessageStatus.DELIVERED } : msg
       ));
     };
 
     // Handle message read status
     const handleMessageRead = (data: { messageId: string; userId: string }) => {
       setMessages(prev => prev.map(msg =>
-        msg.id === data.messageId ? { ...msg, status: 'READ' } : msg
+        msg.id === data.messageId ? { ...msg, status: MessageStatus.READ } : msg
       ));
     };
 
@@ -253,9 +316,11 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
     socket.addEventListener(SocketEvent.USER_ONLINE, handleUserOnline);
     socket.addEventListener(SocketEvent.USER_OFFLINE, handleUserOffline);
 
-    // Cleanup on unmount
+    // Cleanup on unmount - don't leave conversation room, backend auto-manages rooms
     return () => {
-      socket.leaveConversation(conversationId);
+      // Note: We don't call leaveConversation here anymore.
+      // Backend auto-joins users to all their conversation rooms on connect,
+      // so they can receive messages even when not viewing the chat.
       socket.removeEventListener(SocketEvent.MESSAGE_RECEIVED, handleMessageReceived);
       socket.removeEventListener(SocketEvent.MESSAGE_DELIVERED, handleMessageDelivered);
       socket.removeEventListener(SocketEvent.MESSAGE_READ, handleMessageRead);
@@ -266,21 +331,44 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
     };
   }, [conversationId, socket, user?.id]);
 
+  // Audio cleanup on component unmount
+  useEffect(() => {
+    return () => {
+      // Stop recording if active
+      if (isRecording) {
+        audioRecorderPlayer.stopRecorder().catch(() => {});
+        audioRecorderPlayer.removeRecordBackListener();
+      }
+      // Stop playback if active
+      if (playingAudioId) {
+        audioRecorderPlayer.stopPlayer().catch(() => {});
+        audioRecorderPlayer.removePlayBackListener();
+      }
+      // Clear recording timer
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+      }
+      // Stop waveform animations
+      waveformAnims.forEach(anim => anim.stopAnimation());
+    };
+  }, []);
+
   const loadMessages = async () => {
     try {
       setLoading(true);
-      const response = await conversationService.getMessages(conversationId, 100, 0);
+      const response = await conversationService.getMessages(conversationId, 100);
 
       if (response.success && response.data) {
         // Convert API messages to Message format
-        const formattedMessages: Message[] = response.data.messages.map((msg: any) => ({
+        const responseData = response.data as any;
+        const formattedMessages: Message[] = (responseData.messages || []).map((msg: any) => ({
           id: msg.id,
           conversationId: msg.conversationId || msg.conversation_id,
           senderId: msg.senderId || msg.sender_id,
           senderName: msg.senderName || msg.sender_name || 'Unknown',
           content: msg.content || '',
-          type: msg.messageType || msg.message_type || 'TEXT',
-          status: msg.status || 'SENT',
+          type: (msg.messageType || msg.message_type || MessageType.TEXT) as MessageType,
+          status: (msg.status || MessageStatus.SENT) as MessageStatus,
           isEncrypted: msg.isEncrypted || msg.is_encrypted || false,
           createdAt: new Date(msg.createdAt || msg.created_at),
           updatedAt: new Date(msg.updatedAt || msg.updated_at),
@@ -290,15 +378,16 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
             senderName: (msg.replyTo || msg.reply_to).senderName || (msg.replyTo || msg.reply_to).sender_name,
             content: (msg.replyTo || msg.reply_to).content || 'Media',
           } : undefined,
+          isForwarded: msg.isForwarded || msg.is_forwarded || false,
         }));
 
         setMessages(formattedMessages);
       } else {
-        Alert.alert('Error', response.message || 'Failed to load messages');
+        showError('Error', response.message || 'Failed to load messages');
       }
     } catch (error) {
       console.error('Load messages error:', error);
-      Alert.alert('Error', 'Failed to load messages');
+      showError('Error', 'Failed to load messages');
     } finally {
       setLoading(false);
     }
@@ -316,16 +405,25 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
     try {
       const response = await conversationService.getConversations(50, 0);
       if (response.success && response.data) {
-        const formattedConversations: Conversation[] = response.data.conversations
+        const responseData = response.data as any;
+        const formattedConversations: Conversation[] = (responseData.conversations || [])
           .filter((conv: any) => conv.id !== conversationId)
           .map((conv: any) => ({
             id: conv.id,
             name: conv.name || 'Unknown',
             avatar: conv.avatar_url,
-            lastMessage: {
-              content: conv.last_message?.content || '',
-              createdAt: conv.last_message?.created_at || new Date().toISOString(),
-            },
+            lastMessage: conv.last_message ? {
+              id: conv.last_message.id || '',
+              conversationId: conv.id,
+              senderId: conv.last_message.sender_id || '',
+              senderName: conv.last_message.sender_name || '',
+              content: conv.last_message.content || '',
+              type: MessageType.TEXT,
+              status: MessageStatus.SENT,
+              isEncrypted: false,
+              createdAt: new Date(conv.last_message.created_at || Date.now()),
+              updatedAt: new Date(conv.last_message.updated_at || Date.now()),
+            } : undefined,
             unreadCount: conv.unread_count || 0,
             isTyping: false,
           }));
@@ -333,6 +431,42 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       }
     } catch (error) {
       console.error('Load chats error:', error);
+    }
+  };
+
+  // Check block status for this conversation
+  const checkBlockStatus = async (userId: string) => {
+    try {
+      const response = await settingsService.checkIfBlocked(userId);
+      if (response.success && response.data) {
+        setIBlockedThem(response.data.i_blocked_them);
+        setTheyBlockedMe(response.data.they_blocked_me);
+        setIsBlocked(response.data.is_blocked);
+      }
+    } catch (error) {
+      console.error('Check block status error:', error);
+    }
+  };
+
+  // Get the other participant's user ID from the conversation
+  const getRecipientUserId = async () => {
+    try {
+      const response = await conversationService.getConversation(conversationId);
+      if (response.success && response.data) {
+        const convData = response.data as any;
+        const participants = convData.participants || [];
+        const otherParticipant = participants.find((p: any) => {
+          const participantId = p.id || p.user_id;
+          return participantId !== user?.id;
+        });
+        if (otherParticipant) {
+          const recipientId = otherParticipant.id || otherParticipant.user_id;
+          setRecipientUserId(recipientId);
+          await checkBlockStatus(recipientId);
+        }
+      }
+    } catch (error) {
+      console.error('Get recipient user ID error:', error);
     }
   };
 
@@ -346,8 +480,8 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       senderId: user?.id || 'current',
       senderName: user?.displayName || 'You',
       content: inputText.trim(),
-      type: 'TEXT',
-      status: 'SENDING',
+      type: MessageType.TEXT,
+      status: MessageStatus.SENDING,
       isEncrypted: true,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -361,6 +495,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
     // Add optimistic message immediately
     setMessages(prev => [...prev, optimisticMessage]);
     const messageContent = inputText.trim();
+    const replyToId = replyingTo?.id; // Save before clearing
     setInputText('');
     setReplyingTo(null);
 
@@ -373,34 +508,35 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       const response = await messageService.sendMessage({
         conversation_id: conversationId,
         content: messageContent,
-        message_type: 'TEXT',
-        reply_to_id: replyingTo?.id,
+        message_type: MessageType.TEXT,
+        reply_to_id: replyToId,
       });
 
       if (response.success && response.data) {
+        const data = response.data as any;
         // Replace optimistic message with real message
         setMessages(prev => prev.map(msg =>
           msg.id === tempId ? {
             ...msg,
-            id: response.data!.id,
-            status: 'SENT',
-            createdAt: new Date(response.data!.created_at),
-            updatedAt: new Date(response.data!.updated_at),
+            id: data.id,
+            status: MessageStatus.SENT,
+            createdAt: new Date(data.created_at || data.createdAt),
+            updatedAt: new Date(data.updated_at || data.updatedAt),
           } : msg
         ));
       } else {
         // Mark message as failed
         setMessages(prev => prev.map(msg =>
-          msg.id === tempId ? { ...msg, status: 'FAILED' } : msg
+          msg.id === tempId ? { ...msg, status: MessageStatus.FAILED } : msg
         ));
-        Alert.alert('Error', response.message || 'Failed to send message');
+        showError('Error', response.message || 'Failed to send message');
       }
     } catch (error) {
       console.error('Send message error:', error);
       setMessages(prev => prev.map(msg =>
-        msg.id === tempId ? { ...msg, status: 'FAILED' } : msg
+        msg.id === tempId ? { ...msg, status: MessageStatus.FAILED } : msg
       ));
-      Alert.alert('Error', 'Failed to send message');
+      showError('Error', 'Failed to send message');
     }
   };
 
@@ -445,7 +581,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       return response.file_url;
     } catch (error) {
       console.error('Upload error:', error);
-      Alert.alert('Error', 'Failed to upload media');
+      showError('Error', 'Failed to upload media');
       return null;
     } finally {
       setUploadingMedia(false);
@@ -453,7 +589,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
     }
   };
 
-  const sendMediaMessage = async (mediaUrl: string, type: 'IMAGE' | 'VIDEO' | 'AUDIO' | 'DOCUMENT', content?: string) => {
+  const sendMediaMessage = async (mediaUrl: string, type: MessageType, content?: string) => {
     console.log(`[sendMediaMessage] Starting - type: ${type}, mediaUrl: ${mediaUrl}, conversationId: ${conversationId}`);
     try {
       console.log(`[sendMediaMessage] Calling messageService.sendMessage...`);
@@ -467,20 +603,21 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       console.log(`📸 ${type} message response:`, JSON.stringify(response, null, 2));
 
       if (response.success && response.data) {
+        const data = response.data as any;
         const newMessage: Message = {
-          id: response.data.id,
-          conversationId: response.data.conversationId || response.data.conversation_id,
-          senderId: response.data.senderId || response.data.sender_id,
-          senderName: response.data.senderName || response.data.sender_name || 'You',
-          content: response.data.content || '',
-          type: response.data.messageType || response.data.message_type,
-          status: response.data.status,
-          isEncrypted: response.data.isEncrypted || response.data.is_encrypted || false,
-          mediaUrl: response.data.mediaUrl || response.data.media_url,
-          createdAt: new Date(response.data.createdAt || response.data.created_at),
-          updatedAt: new Date(response.data.updatedAt || response.data.updated_at),
+          id: data.id,
+          conversationId: data.conversationId || data.conversation_id,
+          senderId: data.senderId || data.sender_id,
+          senderName: data.senderName || data.sender_name || 'You',
+          content: data.content || '',
+          type: (data.messageType || data.message_type || type) as MessageType,
+          status: (data.status || MessageStatus.SENT) as MessageStatus,
+          isEncrypted: data.isEncrypted || data.is_encrypted || false,
+          mediaUrl: data.mediaUrl || data.media_url,
+          createdAt: new Date(data.createdAt || data.created_at),
+          updatedAt: new Date(data.updatedAt || data.updated_at),
         };
-        console.log(`📸 Created ${type} message:`, JSON.stringify(newMessage, null, 2));
+        console.log(`Created ${type} message:`, JSON.stringify(newMessage, null, 2));
         setMessages(prev => [...prev, newMessage]);
         setTimeout(() => {
           flatListRef.current?.scrollToEnd({ animated: true });
@@ -490,7 +627,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       }
     } catch (error) {
       console.error('[sendMediaMessage] ERROR:', error);
-      Alert.alert('Error', 'Failed to send media message');
+      showError('Error', 'Failed to send media message');
     }
   };
 
@@ -504,20 +641,93 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       if (result.assets && result.assets[0]) {
         const asset = result.assets[0];
         const isVideo = asset.type?.includes('video');
+        const tempId = `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-        const mediaUrl = await uploadMediaFile({
-          uri: asset.uri,
-          type: asset.type || 'image/jpeg',
-          name: asset.fileName || 'capture.jpg',
-        });
+        // Create optimistic message with local URI (WhatsApp-style)
+        const optimisticMessage: Message = {
+          id: tempId,
+          conversationId,
+          senderId: user?.id || '',
+          senderName: user?.displayName || 'You',
+          content: '',
+          type: isVideo ? MessageType.VIDEO : MessageType.IMAGE,
+          status: MessageStatus.SENDING,
+          isEncrypted: false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          localUri: asset.uri,
+          isUploading: true,
+          uploadProgress: 0,
+        };
 
-        if (mediaUrl) {
-          await sendMediaMessage(mediaUrl, isVideo ? 'VIDEO' : 'IMAGE');
+        // Add optimistic message to state immediately
+        setMessages(prev => [...prev, optimisticMessage]);
+        setTimeout(() => {
+          flatListRef.current?.scrollToEnd({ animated: true });
+        }, 100);
+
+        // Upload with progress tracking
+        try {
+          setUploadingMedia(true);
+          const response = await mediaService.uploadMedia({
+            uri: asset.uri,
+            type: asset.type || 'image/jpeg',
+            name: asset.fileName || 'capture.jpg',
+          }, (progress) => {
+            // Update the optimistic message with upload progress
+            setMessages(prev => prev.map(msg =>
+              msg.id === tempId ? { ...msg, uploadProgress: progress } : msg
+            ));
+          });
+
+          if (response.file_url) {
+            // Send the actual message to backend
+            const msgResponse = await messageService.sendMessage({
+              conversation_id: conversationId,
+              content: '',
+              message_type: isVideo ? MessageType.VIDEO : MessageType.IMAGE,
+              media_url: response.file_url,
+            });
+
+            if (msgResponse.success && msgResponse.data) {
+              const data = msgResponse.data as any;
+              // Replace optimistic message with real one
+              setMessages(prev => prev.map(msg =>
+                msg.id === tempId ? {
+                  id: data.id,
+                  conversationId: data.conversationId || data.conversation_id,
+                  senderId: data.senderId || data.sender_id,
+                  senderName: data.senderName || data.sender_name || 'You',
+                  content: data.content || '',
+                  type: (data.messageType || data.message_type || (isVideo ? MessageType.VIDEO : MessageType.IMAGE)) as MessageType,
+                  status: (data.status || MessageStatus.SENT) as MessageStatus,
+                  isEncrypted: data.isEncrypted || data.is_encrypted || false,
+                  mediaUrl: data.mediaUrl || data.media_url,
+                  createdAt: new Date(data.createdAt || data.created_at),
+                  updatedAt: new Date(data.updatedAt || data.updated_at),
+                  isUploading: false,
+                } : msg
+              ));
+            }
+          } else {
+            // Upload failed - mark message as failed
+            setMessages(prev => prev.map(msg =>
+              msg.id === tempId ? { ...msg, status: MessageStatus.FAILED, isUploading: false } : msg
+            ));
+          }
+        } catch (uploadError) {
+          console.error('Upload error:', uploadError);
+          setMessages(prev => prev.map(msg =>
+            msg.id === tempId ? { ...msg, status: MessageStatus.FAILED, isUploading: false } : msg
+          ));
+        } finally {
+          setUploadingMedia(false);
+          setUploadProgress(0);
         }
       }
     } catch (error) {
       console.error('Camera error:', error);
-      Alert.alert('Error', 'Failed to open camera');
+      showError('Error', 'Failed to open camera');
     }
   };
 
@@ -531,20 +741,94 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       if (result.assets) {
         for (const asset of result.assets) {
           const isVideo = asset.type?.includes('video');
-          const mediaUrl = await uploadMediaFile({
-            uri: asset.uri,
-            type: asset.type || 'image/jpeg',
-            name: asset.fileName || 'image.jpg',
-          });
+          const tempId = `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-          if (mediaUrl) {
-            await sendMediaMessage(mediaUrl, isVideo ? 'VIDEO' : 'IMAGE');
+          // Create optimistic message with local URI (WhatsApp-style)
+          const optimisticMessage: Message = {
+            id: tempId,
+            conversationId,
+            senderId: user?.id || '',
+            senderName: user?.displayName || 'You',
+            content: '',
+            type: isVideo ? MessageType.VIDEO : MessageType.IMAGE,
+            status: MessageStatus.SENDING,
+            isEncrypted: false,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            localUri: asset.uri,
+            isUploading: true,
+            uploadProgress: 0,
+          };
+
+          // Add optimistic message to state immediately
+          setMessages(prev => [...prev, optimisticMessage]);
+          setTimeout(() => {
+            flatListRef.current?.scrollToEnd({ animated: true });
+          }, 100);
+
+          // Upload with progress tracking
+          try {
+            setUploadingMedia(true);
+            const response = await mediaService.uploadMedia({
+              uri: asset.uri,
+              type: asset.type || 'image/jpeg',
+              name: asset.fileName || 'image.jpg',
+            }, (progress) => {
+              // Update the optimistic message with upload progress
+              setMessages(prev => prev.map(msg =>
+                msg.id === tempId ? { ...msg, uploadProgress: progress } : msg
+              ));
+            });
+
+            if (response.file_url) {
+              // Send the actual message to backend
+              const msgResponse = await messageService.sendMessage({
+                conversation_id: conversationId,
+                content: '',
+                message_type: isVideo ? MessageType.VIDEO : MessageType.IMAGE,
+                media_url: response.file_url,
+              });
+
+              if (msgResponse.success && msgResponse.data) {
+                const data = msgResponse.data as any;
+                // Replace optimistic message with real one
+                setMessages(prev => prev.map(msg =>
+                  msg.id === tempId ? {
+                    id: data.id,
+                    conversationId: data.conversationId || data.conversation_id,
+                    senderId: data.senderId || data.sender_id,
+                    senderName: data.senderName || data.sender_name || 'You',
+                    content: data.content || '',
+                    type: (data.messageType || data.message_type || (isVideo ? MessageType.VIDEO : MessageType.IMAGE)) as MessageType,
+                    status: (data.status || MessageStatus.SENT) as MessageStatus,
+                    isEncrypted: data.isEncrypted || data.is_encrypted || false,
+                    mediaUrl: data.mediaUrl || data.media_url,
+                    createdAt: new Date(data.createdAt || data.created_at),
+                    updatedAt: new Date(data.updatedAt || data.updated_at),
+                    isUploading: false,
+                  } : msg
+                ));
+              }
+            } else {
+              // Upload failed - mark message as failed
+              setMessages(prev => prev.map(msg =>
+                msg.id === tempId ? { ...msg, status: MessageStatus.FAILED, isUploading: false } : msg
+              ));
+            }
+          } catch (uploadError) {
+            console.error('Upload error:', uploadError);
+            setMessages(prev => prev.map(msg =>
+              msg.id === tempId ? { ...msg, status: MessageStatus.FAILED, isUploading: false } : msg
+            ));
+          } finally {
+            setUploadingMedia(false);
+            setUploadProgress(0);
           }
         }
       }
     } catch (error) {
       console.error('Gallery error:', error);
-      Alert.alert('Error', 'Failed to open gallery');
+      showError('Error', 'Failed to open gallery');
     }
   };
 
@@ -590,7 +874,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
 
               await sendMediaMessage(
                 mediaUrl,
-                'DOCUMENT',
+                MessageType.DOCUMENT,
                 JSON.stringify({
                   name: doc.name,
                   size: displaySize,
@@ -609,7 +893,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
           console.log('User cancelled document picker');
         } else {
           console.error('Document picker error:', err);
-          Alert.alert('Error', 'Failed to pick document');
+          showError('Error', 'Failed to pick document');
         }
       }
     }, 300);
@@ -627,7 +911,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
         },
         (error) => {
           console.error('Location error:', error);
-          Alert.alert('Error', 'Could not get your location. Please check your location settings.');
+          showError('Error', 'Could not get your location. Please check your location settings.');
         },
         {
           enableHighAccuracy: true,
@@ -638,34 +922,42 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
     }, 300);
   };
 
-  const sendLocation = async (isLive: boolean) => {
-    if (!currentLocation) return;
+  const sendLocation = async (isLive: boolean, customLocation?: { latitude: number; longitude: number }, durationMinutes?: number) => {
+    const locationToSend = customLocation || currentLocation;
+    if (!locationToSend) return;
 
-    const locationData = {
-      latitude: currentLocation.latitude,
-      longitude: currentLocation.longitude,
+    const locationData: any = {
+      latitude: locationToSend.latitude,
+      longitude: locationToSend.longitude,
       isLive,
     };
+
+    // Add duration for live location
+    if (isLive && durationMinutes) {
+      locationData.durationMinutes = durationMinutes;
+      locationData.expiresAt = new Date(Date.now() + durationMinutes * 60 * 1000).toISOString();
+    }
 
     try {
       const response = await messageService.sendMessage({
         conversation_id: conversationId,
         content: JSON.stringify(locationData),
-        message_type: 'LOCATION',
+        message_type: MessageType.LOCATION,
       });
 
       if (response.success && response.data) {
+        const data = response.data as any;
         const newMessage: Message = {
-          id: response.data.id,
-          conversationId: response.data.conversation_id,
-          senderId: response.data.sender_id,
-          senderName: response.data.sender_name || 'You',
-          content: response.data.content,
-          type: 'LOCATION',
-          status: response.data.status,
-          isEncrypted: response.data.is_encrypted || false,
-          createdAt: new Date(response.data.created_at),
-          updatedAt: new Date(response.data.updated_at),
+          id: data.id,
+          conversationId: data.conversationId || data.conversation_id,
+          senderId: data.senderId || data.sender_id,
+          senderName: data.senderName || data.sender_name || 'You',
+          content: data.content,
+          type: MessageType.LOCATION,
+          status: data.status as MessageStatus,
+          isEncrypted: data.isEncrypted || data.is_encrypted || false,
+          createdAt: new Date(data.createdAt || data.created_at),
+          updatedAt: new Date(data.updatedAt || data.updated_at),
         };
 
         setMessages(prev => [...prev, newMessage]);
@@ -678,7 +970,29 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       }
     } catch (error) {
       console.error('Send location error:', error);
-      Alert.alert('Error', 'Failed to send location');
+      showError('Error', 'Failed to send location');
+    }
+  };
+
+  // Open image in full screen preview
+  const openImagePreview = (imageUrl: string, caption?: string) => {
+    setPreviewImageUrl(imageUrl);
+    setPreviewImageCaption(caption || '');
+    setShowImagePreview(true);
+  };
+
+  // Open document (download/preview)
+  const openDocument = async (documentUrl: string, documentName: string) => {
+    try {
+      const supported = await Linking.canOpenURL(documentUrl);
+      if (supported) {
+        await Linking.openURL(documentUrl);
+      } else {
+        showError('Error', 'Cannot open this document');
+      }
+    } catch (error) {
+      console.error('Error opening document:', error);
+      showError('Error', 'Failed to open document');
     }
   };
 
@@ -732,25 +1046,26 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
             name: contact.name,
             phone: contact.phone,
           }),
-          message_type: 'CONTACT',
+          message_type: MessageType.CONTACT,
         });
 
-        console.log('📧 Contact message response:', JSON.stringify(response, null, 2));
+        console.log('Contact message response:', JSON.stringify(response, null, 2));
 
         if (response.success && response.data) {
+          const data = response.data as any;
           const newMessage: Message = {
-            id: response.data.id,
-            conversationId: response.data.conversationId || response.data.conversation_id,
-            senderId: response.data.senderId || response.data.sender_id,
-            senderName: response.data.senderName || response.data.sender_name || 'You',
-            content: response.data.content,
-            type: 'CONTACT',
-            status: response.data.status,
-            isEncrypted: response.data.isEncrypted || response.data.is_encrypted || false,
-            createdAt: new Date(response.data.createdAt || response.data.created_at),
-            updatedAt: new Date(response.data.updatedAt || response.data.updated_at),
+            id: data.id,
+            conversationId: data.conversationId || data.conversation_id,
+            senderId: data.senderId || data.sender_id,
+            senderName: data.senderName || data.sender_name || 'You',
+            content: data.content,
+            type: MessageType.CONTACT,
+            status: data.status as MessageStatus,
+            isEncrypted: data.isEncrypted || data.is_encrypted || false,
+            createdAt: new Date(data.createdAt || data.created_at),
+            updatedAt: new Date(data.updatedAt || data.updated_at),
           };
-          console.log('📧 Created contact message:', JSON.stringify(newMessage, null, 2));
+          console.log('Created contact message:', JSON.stringify(newMessage, null, 2));
           setMessages(prev => [...prev, newMessage]);
         } else {
           console.log(`[sendContacts] Response not successful or no data:`, response);
@@ -816,19 +1131,24 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
   const confirmForward = async () => {
     if (selectedForwardChats.length > 0 && selectedMessage) {
       try {
-        const response = await messageService.forwardMessages({
-          message_ids: [selectedMessage.id],
-          target_conversation_ids: selectedForwardChats,
-        });
+        // Forward to each selected conversation
+        let successCount = 0;
+        for (const targetConvId of selectedForwardChats) {
+          const forwardResponse = await messageService.forwardMessages({
+            message_ids: [selectedMessage.id],
+            conversation_id: targetConvId,
+          });
+          if (forwardResponse.success) successCount++;
+        }
 
-        if (response.success) {
+        if (successCount > 0) {
           showToastNotification(`Message forwarded to ${selectedForwardChats.length} chat${selectedForwardChats.length > 1 ? 's' : ''}`);
         } else {
-          Alert.alert('Error', response.message || 'Failed to forward message');
+          showError('Error', 'Failed to forward message');
         }
       } catch (error) {
         console.error('Forward error:', error);
-        Alert.alert('Error', 'Failed to forward message');
+        showError('Error', 'Failed to forward message');
       }
 
       setShowForwardModal(false);
@@ -873,17 +1193,18 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
   const deleteForMe = async () => {
     if (messageToDelete) {
       try {
-        const response = await messageService.deleteMessage(messageToDelete.id, false);
+        // Delete message - API only supports single delete, removes for current user
+        const response = await messageService.deleteMessage(messageToDelete.id);
 
         if (response.success) {
           setMessages(prev => prev.filter(m => m.id !== messageToDelete.id));
           showToastNotification('Message deleted');
         } else {
-          Alert.alert('Error', response.message || 'Failed to delete message');
+          showError('Error', response.message || 'Failed to delete message');
         }
       } catch (error) {
         console.error('Delete error:', error);
-        Alert.alert('Error', 'Failed to delete message');
+        showError('Error', 'Failed to delete message');
       }
 
       setShowDeleteModal(false);
@@ -895,17 +1216,18 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
   const deleteForEveryone = async () => {
     if (messageToDelete) {
       try {
-        const response = await messageService.deleteMessage(messageToDelete.id, true);
+        // Delete message for everyone - uses same API endpoint
+        const response = await messageService.deleteMessage(messageToDelete.id);
 
         if (response.success) {
           setMessages(prev => prev.filter(m => m.id !== messageToDelete.id));
           showToastNotification('Message deleted for everyone');
         } else {
-          Alert.alert('Error', response.message || 'Failed to delete message');
+          showError('Error', response.message || 'Failed to delete message');
         }
       } catch (error) {
         console.error('Delete error:', error);
-        Alert.alert('Error', 'Failed to delete message');
+        showError('Error', 'Failed to delete message');
       }
 
       setShowDeleteModal(false);
@@ -927,7 +1249,10 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       const isStarred = newStarred.has(selectedMessage.id);
 
       try {
-        const response = await messageService.starMessage(selectedMessage.id, !isStarred);
+        // Use starMessage or unstarMessage based on current state
+        const response = isStarred
+          ? await messageService.unstarMessage(selectedMessage.id)
+          : await messageService.starMessage(selectedMessage.id);
 
         if (response.success) {
           if (isStarred) {
@@ -939,11 +1264,11 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
           }
           setStarredMessages(newStarred);
         } else {
-          Alert.alert('Error', response.message || 'Failed to star message');
+          showError('Error', response.message || 'Failed to star message');
         }
       } catch (error) {
         console.error('Star error:', error);
-        Alert.alert('Error', 'Failed to star message');
+        showError('Error', 'Failed to star message');
       }
 
       setSelectedMessage(null);
@@ -968,62 +1293,113 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
     setReplyingTo(null);
   };
 
-  const handleChatMenu = async () => {
-    Alert.alert(
-      'Chat Options',
-      'Choose an action',
-      [
-        {
-          text: 'View Contact',
-          onPress: () => Alert.alert('Contact Info', `Name: ${recipientName}\nPhone: ${recipientPhone}`),
-        },
-        {
-          text: 'Search Messages',
-          onPress: () => Alert.alert('Search', 'Search through messages in this chat'),
-        },
-        {
-          text: 'Mute Notifications',
-          onPress: async () => {
-            try {
-              const response = await conversationService.muteConversation(conversationId, 24);
-              if (response.success) {
-                Alert.alert('Muted', 'Notifications muted for this chat');
-              }
-            } catch (error) {
-              console.error('Mute error:', error);
-            }
-          },
-        },
-        {
-          text: 'Clear Chat',
-          onPress: () => Alert.alert('Clear Chat', 'Are you sure you want to clear all messages?', [
-            { text: 'Cancel', style: 'cancel' },
-            {
-              text: 'Clear',
-              style: 'destructive',
-              onPress: async () => {
-                try {
-                  const response = await conversationService.clearHistory(conversationId);
-                  if (response.success) {
-                    setMessages([]);
-                  }
-                } catch (error) {
-                  console.error('Clear error:', error);
-                }
-              }
-            },
-          ]),
-        },
-        {
-          text: 'Block User',
-          onPress: () => Alert.alert('Block', `Block ${recipientName}?`, [
-            { text: 'Cancel', style: 'cancel' },
-            { text: 'Block', style: 'destructive' },
-          ]),
-        },
-        { text: 'Cancel', style: 'cancel' },
-      ]
+  const handleChatMenu = () => {
+    setShowChatOptionsMenu(true);
+  };
+
+  const handleViewContact = () => {
+    setShowChatOptionsMenu(false);
+    showModal({
+      type: 'info',
+      title: 'Contact Info',
+      message: `Name: ${recipientName}\nPhone: ${recipientPhone || 'Not available'}`,
+      icon: 'person-circle',
+      primaryButton: {
+        text: 'OK',
+        onPress: () => {},
+        variant: 'primary',
+      },
+    });
+  };
+
+
+  const handleMuteNotifications = async () => {
+    setShowChatOptionsMenu(false);
+    try {
+      const response = await conversationService.muteConversation(conversationId);
+      if (response.success) {
+        showSuccess('Muted', 'Notifications muted for this chat');
+      }
+    } catch (error) {
+      console.error('Mute error:', error);
+      showError('Error', 'Failed to mute notifications');
+    }
+  };
+
+  const handleClearChat = () => {
+    setShowChatOptionsMenu(false);
+    showConfirm(
+      'Clear Chat',
+      'Are you sure you want to clear all messages? This action cannot be undone.',
+      async () => {
+        try {
+          const response = await conversationService.clearHistory(conversationId);
+          if (response.success) {
+            setMessages([]);
+            showSuccess('Cleared', 'All messages have been cleared');
+          }
+        } catch (error) {
+          console.error('Clear error:', error);
+          showError('Error', 'Failed to clear chat');
+        }
+      }
     );
+  };
+
+  const handleBlockUser = () => {
+    setShowChatOptionsMenu(false);
+
+    if (iBlockedThem) {
+      // User is already blocked, show unblock option
+      showConfirm(
+        'Unblock User',
+        `Are you sure you want to unblock ${recipientName}? They will be able to message you again.`,
+        async () => {
+          if (!recipientUserId) {
+            showError('Error', 'Unable to unblock user. Please try again.');
+            return;
+          }
+          try {
+            const response = await settingsService.unblockUser(recipientUserId);
+            if (response.success) {
+              setIBlockedThem(false);
+              setIsBlocked(theyBlockedMe);
+              showSuccess('Unblocked', `${recipientName} has been unblocked`);
+            } else {
+              showError('Error', response.message || 'Failed to unblock user');
+            }
+          } catch (error) {
+            console.error('Unblock error:', error);
+            showError('Error', 'Failed to unblock user');
+          }
+        }
+      );
+    } else {
+      // Block the user
+      showConfirm(
+        'Block User',
+        `Are you sure you want to block ${recipientName}? They won't be able to message you and you won't receive their messages.`,
+        async () => {
+          if (!recipientUserId) {
+            showError('Error', 'Unable to block user. Please try again.');
+            return;
+          }
+          try {
+            const response = await settingsService.blockUser(recipientUserId);
+            if (response.success) {
+              setIBlockedThem(true);
+              setIsBlocked(true);
+              showSuccess('Blocked', `${recipientName} has been blocked`);
+            } else {
+              showError('Error', response.message || 'Failed to block user');
+            }
+          } catch (error) {
+            console.error('Block error:', error);
+            showError('Error', 'Failed to block user');
+          }
+        }
+      );
+    }
   };
 
   // Voice recording functions
@@ -1083,14 +1459,22 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       // Request permission first
       const hasPermission = await requestAudioPermission();
       if (!hasPermission) {
-        Alert.alert(
-          'Permission Required',
-          'Please allow microphone access to record voice messages',
-          [
-            { text: 'Cancel', style: 'cancel' },
-            { text: 'Settings', onPress: () => Linking.openSettings() },
-          ]
-        );
+        showModal({
+          type: 'warning',
+          title: 'Permission Required',
+          message: 'Please allow microphone access to record voice messages',
+          icon: 'mic',
+          primaryButton: {
+            text: 'Settings',
+            onPress: () => Linking.openSettings(),
+            variant: 'primary',
+          },
+          secondaryButton: {
+            text: 'Cancel',
+            onPress: () => {},
+            variant: 'secondary',
+          },
+        });
         return;
       }
 
@@ -1127,11 +1511,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       console.log('Recording started, isRecording set to true');
     } catch (error) {
       console.error('Failed to start recording:', error);
-      Alert.alert(
-        'Recording Failed',
-        'Could not start voice recording. Please try again.',
-        [{ text: 'OK' }]
-      );
+      showError('Recording Failed', 'Could not start voice recording. Please try again.');
     }
   };
 
@@ -1178,23 +1558,24 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
             const response = await messageService.sendMessage({
               conversation_id: conversationId,
               content: `Voice message (${formatTime(recordingTime)})`,
-              message_type: 'AUDIO',
+              message_type: MessageType.AUDIO,
               media_url: mediaUrl,
             });
 
             if (response.success && response.data) {
+              const data = response.data as any;
               const newMessage: Message = {
-                id: response.data.id,
-                conversationId: response.data.conversation_id,
-                senderId: response.data.sender_id,
-                senderName: response.data.sender_name || 'You',
-                content: response.data.content,
-                type: 'AUDIO',
-                status: response.data.status,
-                isEncrypted: response.data.is_encrypted || false,
-                mediaUrl: response.data.media_url,
-                createdAt: new Date(response.data.created_at),
-                updatedAt: new Date(response.data.updated_at),
+                id: data.id,
+                conversationId: data.conversationId || data.conversation_id,
+                senderId: data.senderId || data.sender_id,
+                senderName: data.senderName || data.sender_name || 'You',
+                content: data.content,
+                type: MessageType.AUDIO,
+                status: (data.status || MessageStatus.SENT) as MessageStatus,
+                isEncrypted: data.isEncrypted || data.is_encrypted || false,
+                mediaUrl: data.mediaUrl || data.media_url,
+                createdAt: new Date(data.createdAt || data.created_at),
+                updatedAt: new Date(data.updatedAt || data.updated_at),
               };
 
               setMessages(prev => [...prev, newMessage]);
@@ -1206,12 +1587,12 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
                 flatListRef.current?.scrollToEnd({ animated: true });
               }, 500);
             } else {
-              Alert.alert('Error', 'Failed to send voice message');
+              showError('Error', 'Failed to send voice message');
             }
           }
         } catch (error) {
           console.error('Failed to send voice message:', error);
-          Alert.alert('Error', 'Failed to send voice message');
+          showError('Error', 'Failed to send voice message');
         } finally {
           setUploadingMedia(false);
         }
@@ -1221,7 +1602,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       recordingPath.current = '';
     } catch (error) {
       console.error('Failed to stop recording:', error);
-      Alert.alert('Error', 'Failed to stop recording');
+      showError('Error', 'Failed to stop recording');
     }
   };
 
@@ -1298,7 +1679,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
       });
     } catch (error) {
       console.error('Failed to play audio:', error);
-      Alert.alert('Error', 'Failed to play voice message');
+      showError('Error', 'Failed to play voice message');
       setPlayingAudioId(null);
     }
   };
@@ -1412,6 +1793,15 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
             <View style={[styles.accentLine, { backgroundColor: theme.primaryLight }]} />
           )}
 
+          {item.isForwarded && (
+            <View style={styles.forwardedTag}>
+              <Icon name="arrow-redo" size={12} color={isMine ? 'rgba(255, 255, 255, 0.6)' : theme.textSecondary} />
+              <Text style={[styles.forwardedText, { color: isMine ? 'rgba(255, 255, 255, 0.6)' : theme.textSecondary }]}>
+                Forwarded
+              </Text>
+            </View>
+          )}
+
           {item.replyTo && (
             <View style={[styles.replyPreview, { backgroundColor: isMine ? 'rgba(0, 0, 0, 0.1)' : 'rgba(0, 0, 0, 0.05)', borderLeftColor: theme.primary }]}>
               <Text style={[styles.replyPreviewSender, { color: theme.primary }]} numberOfLines={1}>
@@ -1516,7 +1906,15 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
             </View>
           ) :
           isDocument && documentData ? (
-            <View style={[styles.documentContainer, { backgroundColor: isMine ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.05)' }]}>
+            <TouchableOpacity
+              style={[styles.documentContainer, { backgroundColor: isMine ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.05)' }]}
+              activeOpacity={0.7}
+              onPress={() => {
+                if (item.mediaUrl) {
+                  openDocument(item.mediaUrl, documentData.name);
+                }
+              }}
+            >
               <View style={[styles.documentIconContainer, { backgroundColor: isMine ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.1)' }]}>
                 <Icon
                   name="document-text"
@@ -1543,7 +1941,13 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
                   {documentData.size}
                 </Text>
               </View>
-            </View>
+              <Icon
+                name="download-outline"
+                size={22}
+                color={isMine ? theme.messageBubble.sentText : theme.primary}
+                style={{ marginLeft: 8 }}
+              />
+            </TouchableOpacity>
           ) :
           item.type === 'AUDIO' ? (
             <View style={[styles.audioContainer, { backgroundColor: isMine ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.05)' }]}>
@@ -1568,14 +1972,63 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
               </Text>
             </View>
           ) :
-          isMediaMessage && item.mediaUrl ? (
-            <View style={styles.mediaContainer}>
+          isMediaMessage && (item.mediaUrl || item.localUri) ? (
+            <TouchableOpacity
+              style={styles.mediaContainer}
+              activeOpacity={0.9}
+              onPress={() => {
+                if (!item.isUploading && (item.localUri || item.mediaUrl)) {
+                  openImagePreview(item.localUri || item.mediaUrl!, item.content);
+                }
+              }}
+            >
               <Image
-                source={{ uri: item.mediaUrl }}
-                style={styles.mediaImage}
+                source={{ uri: item.localUri || item.mediaUrl }}
+                style={[
+                  styles.mediaImage,
+                  item.isUploading && styles.mediaImageUploading,
+                ]}
                 resizeMode="cover"
+                blurRadius={item.isUploading ? 10 : 0}
               />
-              {item.type === 'VIDEO' && (
+              {/* Upload Progress Overlay - WhatsApp style */}
+              {item.isUploading && (
+                <View style={styles.uploadOverlay}>
+                  <View style={styles.uploadProgressContainer}>
+                    {/* Circular Progress Background */}
+                    <View style={styles.circularProgressBg}>
+                      {/* Progress Arc */}
+                      <View style={[
+                        styles.circularProgress,
+                        {
+                          transform: [{ rotate: `${(item.uploadProgress || 0) * 3.6}deg` }],
+                        }
+                      ]} />
+                    </View>
+                    {/* Progress Percentage */}
+                    <Text style={styles.uploadProgressText}>
+                      {Math.round(item.uploadProgress || 0)}%
+                    </Text>
+                  </View>
+                  {/* Cancel Button */}
+                  <TouchableOpacity style={styles.uploadCancelButton}>
+                    <Icon name="close" size={16} color="#fff" />
+                  </TouchableOpacity>
+                </View>
+              )}
+              {/* Failed Upload Overlay */}
+              {item.status === MessageStatus.FAILED && !item.isUploading && (
+                <View style={styles.uploadOverlay}>
+                  <View style={styles.failedUploadContainer}>
+                    <Icon name="alert-circle" size={32} color="#ff4444" />
+                    <Text style={styles.failedUploadText}>Failed</Text>
+                    <TouchableOpacity style={styles.retryButton}>
+                      <Icon name="refresh" size={20} color="#fff" />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              )}
+              {item.type === 'VIDEO' && !item.isUploading && (
                 <View style={styles.videoOverlay}>
                   <Icon name="play-circle" size={48} color="rgba(255, 255, 255, 0.9)" />
                 </View>
@@ -1592,7 +2045,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
                   </Text>
                 </View>
               )}
-            </View>
+            </TouchableOpacity>
           ) : (
             <Text
               style={[
@@ -1628,7 +2081,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
             </Text>
             {isMine && (
               <Icon
-                name={item.status === 'READ' ? 'checkmark-done' : 'checkmark'}
+                name={item.status === 'SENT' ? 'checkmark' : 'checkmark-done'}
                 size={16}
                 color={item.status === 'READ' ? '#4FC3F7' : 'rgba(255, 255, 255, 0.8)'}
                 style={styles.checkmark}
@@ -1735,7 +2188,8 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
           renderItem={renderMessage}
           keyExtractor={item => item.id}
           contentContainerStyle={styles.messageList}
-          inverted
+          onContentSizeChange={() => flatListRef.current?.scrollToEnd()}
+          onLayout={() => flatListRef.current?.scrollToEnd()}
         />
 
       {/* Upload Progress */}
@@ -1768,43 +2222,75 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
         </View>
       )}
 
-      <View
-        style={[
-          styles.inputContainer,
-          {
-            backgroundColor: theme.surface,
-            borderTopColor: theme.border,
-          },
-        ]}
-      >
-        <TouchableOpacity
-          style={styles.attachButton}
-          onPress={handleAttachment}
-          activeOpacity={0.7}
+      {/* Blocked User Banner */}
+      {isBlocked ? (
+        <View
+          style={[
+            styles.blockedBanner,
+            {
+              backgroundColor: theme.surface,
+              borderTopColor: theme.border,
+            },
+          ]}
         >
-          <Icon name="add-circle" size={28} color={theme.primary} />
-        </TouchableOpacity>
-
-        <View style={[styles.inputWrapper, { backgroundColor: theme.surfaceElevated }]}>
+          <Icon
+            name={iBlockedThem ? "ban" : "hand-left"}
+            size={24}
+            color={theme.error || '#FF3B30'}
+          />
+          <Text style={[styles.blockedBannerText, { color: theme.textSecondary }]}>
+            {iBlockedThem
+              ? "You blocked this user. Unblock to send messages."
+              : "You can't reply to this conversation."}
+          </Text>
+        </View>
+      ) : (
+        <View
+          style={[
+            styles.inputContainer,
+            {
+              backgroundColor: theme.surface,
+              borderTopColor: theme.border,
+            },
+          ]}
+        >
           <TouchableOpacity
-            style={styles.emojiButton}
-            onPress={toggleEmojiPicker}
+            style={styles.attachButton}
+            onPress={handleAttachment}
             activeOpacity={0.7}
           >
-            <Icon name="happy-outline" size={24} color={theme.textSecondary} />
+            <Icon name="add-circle" size={28} color={theme.primary} />
           </TouchableOpacity>
 
-          <TextInput
-            style={[styles.input, { color: theme.text }]}
-            placeholder="Type a message..."
-            placeholderTextColor={theme.textSecondary}
-            value={inputText}
-            onChangeText={setInputText}
-            multiline
-            maxLength={1000}
-          />
-        </View>
+          <View style={[styles.inputWrapper, { backgroundColor: theme.surfaceElevated }]}>
+            <TouchableOpacity
+              style={styles.emojiButton}
+              onPress={toggleEmojiPicker}
+              activeOpacity={0.7}
+            >
+              <Icon name="happy-outline" size={24} color={theme.textSecondary} />
+            </TouchableOpacity>
 
+            <TextInput
+              style={[styles.input, { color: theme.text }]}
+              placeholder="Type a message..."
+              placeholderTextColor={theme.textSecondary}
+              value={inputText}
+              onChangeText={setInputText}
+              multiline
+              maxLength={1000}
+            />
+          </View>
+
+          {/* Voice note button temporarily disabled */}
+          <TouchableOpacity
+            style={[styles.sendButton, { backgroundColor: theme.primary }]}
+            onPress={handleSend}
+            activeOpacity={0.7}
+          >
+            <Icon name="send" size={22} color="#FFFFFF" />
+          </TouchableOpacity>
+        {/* Original voice note / send toggle:
         {inputText.trim() ? (
           <TouchableOpacity
             style={[styles.sendButton, { backgroundColor: theme.primary }]}
@@ -1829,10 +2315,12 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
             <Icon name="mic" size={24} color="#FFFFFF" />
           </TouchableOpacity>
         )}
-      </View>
+        */}
+        </View>
+      )}
       </KeyboardAvoidingView>
 
-      {/* Voice Recording UI */}
+      {/* Voice Recording UI - temporarily disabled
       {isRecording && (
         <>
           {console.log('Rendering recording UI, isRecording:', isRecording)}
@@ -1943,6 +2431,7 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
         </View>
         </>
       )}
+      */}
 
       {/* WhatsApp-style Attachment Menu */}
       <AttachmentModal
@@ -1967,7 +2456,8 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
           setCurrentLocation(null);
         }}
         onSendCurrentLocation={() => sendLocation(false)}
-        onShareLiveLocation={() => sendLocation(true)}
+        onShareLiveLocation={(duration) => sendLocation(true, undefined, duration)}
+        onSendSelectedLocation={(selectedLoc) => sendLocation(false, selectedLoc)}
       />
 
       {/* Contact Picker Modal */}
@@ -2131,6 +2621,64 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
         onDeleteForEveryone={deleteForEveryone}
       />
 
+      {/* Chat Options Popover Menu */}
+      <Modal
+        visible={showChatOptionsMenu}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setShowChatOptionsMenu(false)}
+      >
+        <TouchableWithoutFeedback onPress={() => setShowChatOptionsMenu(false)}>
+          <View style={styles.popoverOverlay}>
+            <View style={[styles.popoverMenu, { backgroundColor: theme.surface }]}>
+              <View style={[styles.popoverArrow, { backgroundColor: theme.surface }]} />
+
+              <TouchableOpacity
+                style={styles.popoverMenuItem}
+                onPress={handleViewContact}
+                activeOpacity={0.7}
+              >
+                <Icon name="person-outline" size={20} color={theme.text} />
+                <Text style={[styles.popoverMenuText, { color: theme.text }]}>View Contact</Text>
+              </TouchableOpacity>
+
+              <View style={[styles.popoverDivider, { backgroundColor: theme.border }]} />
+
+              <TouchableOpacity
+                style={styles.popoverMenuItem}
+                onPress={handleMuteNotifications}
+                activeOpacity={0.7}
+              >
+                <Icon name="notifications-off-outline" size={20} color={theme.text} />
+                <Text style={[styles.popoverMenuText, { color: theme.text }]}>Mute Notifications</Text>
+              </TouchableOpacity>
+
+              <View style={[styles.popoverDivider, { backgroundColor: theme.border }]} />
+
+              <TouchableOpacity
+                style={styles.popoverMenuItem}
+                onPress={handleClearChat}
+                activeOpacity={0.7}
+              >
+                <Icon name="trash-outline" size={20} color={theme.error} />
+                <Text style={[styles.popoverMenuText, { color: theme.error }]}>Clear Chat</Text>
+              </TouchableOpacity>
+
+              <View style={[styles.popoverDivider, { backgroundColor: theme.border }]} />
+
+              <TouchableOpacity
+                style={styles.popoverMenuItem}
+                onPress={handleBlockUser}
+                activeOpacity={0.7}
+              >
+                <Icon name={iBlockedThem ? "checkmark-circle-outline" : "ban-outline"} size={20} color={iBlockedThem ? theme.primary : theme.error} />
+                <Text style={[styles.popoverMenuText, { color: iBlockedThem ? theme.primary : theme.error }]}>{iBlockedThem ? 'Unblock User' : 'Block User'}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+
       {/* Toast Notification */}
       {showToast && (
         <View style={styles.toastContainer}>
@@ -2147,6 +2695,35 @@ const ChatRoomScreen = ({ route, navigation }: Props) => {
         recipientName={recipientName}
         onClose={closeMessageInfo}
       />
+
+      {/* Image Preview Modal */}
+      <Modal
+        visible={showImagePreview}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setShowImagePreview(false)}
+      >
+        <View style={styles.imagePreviewContainer}>
+          <TouchableOpacity
+            style={styles.imagePreviewCloseButton}
+            onPress={() => setShowImagePreview(false)}
+          >
+            <Icon name="close" size={28} color="#fff" />
+          </TouchableOpacity>
+          {previewImageUrl && (
+            <Image
+              source={{ uri: previewImageUrl }}
+              style={styles.imagePreviewImage}
+              resizeMode="contain"
+            />
+          )}
+          {previewImageCaption ? (
+            <View style={styles.imagePreviewCaptionContainer}>
+              <Text style={styles.imagePreviewCaption}>{previewImageCaption}</Text>
+            </View>
+          ) : null}
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 };
@@ -2290,6 +2867,79 @@ const styles = StyleSheet.create({
     width: 250,
     height: 250,
     borderRadius: 12,
+  },
+  mediaImageUploading: {
+    opacity: 0.7,
+  },
+  uploadOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.4)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 12,
+  },
+  uploadProgressContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  circularProgressBg: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    borderWidth: 3,
+    borderColor: 'rgba(255, 255, 255, 0.3)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  circularProgress: {
+    position: 'absolute',
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    borderWidth: 3,
+    borderColor: '#25D366',
+    borderTopColor: 'transparent',
+    borderRightColor: 'transparent',
+  },
+  uploadProgressText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  uploadCancelButton: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  failedUploadContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  failedUploadText: {
+    color: '#ff4444',
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 4,
+  },
+  retryButton: {
+    marginTop: 8,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   videoOverlay: {
     position: 'absolute',
@@ -2490,6 +3140,21 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderTopWidth: 1,
     gap: 6,
+  },
+  blockedBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+    borderTopWidth: 1,
+    gap: 10,
+  },
+  blockedBannerText: {
+    fontSize: 14,
+    fontWeight: '500',
+    textAlign: 'center',
+    flex: 1,
   },
   attachButton: {
     padding: 6,
@@ -2743,6 +3408,16 @@ const styles = StyleSheet.create({
   replyPreviewContent: {
     fontSize: 12,
   },
+  forwardedTag: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+    gap: 4,
+  },
+  forwardedText: {
+    fontSize: 11,
+    fontStyle: 'italic',
+  },
   toastContainer: {
     position: 'absolute',
     bottom: 80,
@@ -2772,6 +3447,84 @@ const styles = StyleSheet.create({
   },
   uploadProgressText: {
     fontSize: 14,
+  },
+  // Image Preview Modal Styles
+  imagePreviewContainer: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.95)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  imagePreviewCloseButton: {
+    position: 'absolute',
+    top: 50,
+    right: 20,
+    zIndex: 10,
+    padding: 10,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    borderRadius: 20,
+  },
+  imagePreviewImage: {
+    width: '100%',
+    height: '80%',
+  },
+  imagePreviewCaptionContainer: {
+    position: 'absolute',
+    bottom: 40,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    padding: 12,
+    borderRadius: 8,
+  },
+  imagePreviewCaption: {
+    color: '#fff',
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  // Popover Menu Styles
+  popoverOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.3)',
+  },
+  popoverMenu: {
+    position: 'absolute',
+    top: Platform.OS === 'ios' ? 95 : 55,
+    right: 12,
+    minWidth: 200,
+    borderRadius: 12,
+    paddingVertical: 8,
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 4,
+    },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  popoverArrow: {
+    position: 'absolute',
+    top: -8,
+    right: 16,
+    width: 16,
+    height: 16,
+    transform: [{ rotate: '45deg' }],
+  },
+  popoverMenuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    gap: 12,
+  },
+  popoverMenuText: {
+    fontSize: 15,
+    fontWeight: '500',
+  },
+  popoverDivider: {
+    height: 1,
+    marginHorizontal: 16,
   },
 });
 

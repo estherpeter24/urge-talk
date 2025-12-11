@@ -84,6 +84,24 @@ class UserService {
     return response;
   }
 
+  async getUsersByIds(userIds: string[]) {
+    if (userIds.length === 0) {
+      return { success: true, data: { users: [] } };
+    }
+    // Use POST to send array of IDs in body (more reliable for large lists)
+    const response = await apiClient.post<any>('/users/batch', { user_ids: userIds });
+
+    if (response.success && response.data) {
+      return {
+        ...response,
+        data: {
+          users: (response.data.users || []).map(transformUser),
+        }
+      };
+    }
+    return response;
+  }
+
   async getUserStatus(userId: string) {
     const response = await apiClient.get<UserStatusResponse>(`/users/${userId}/status`);
     return response;
@@ -106,38 +124,12 @@ class UserService {
     return response;
   }
 
-  // Privacy & Settings
-  async blockUser(userId: string) {
-    const response = await apiClient.post(`/settings/privacy/block/${userId}`, {});
-    return response;
-  }
-
-  async unblockUser(userId: string) {
-    const response = await apiClient.delete(`/settings/privacy/unblock/${userId}`);
-    return response;
-  }
-
-  async getBlockedUsers() {
-    const response = await apiClient.get<string[]>('/settings/privacy/blocked');
-    return response;
-  }
-
-  // Notification settings
+  // Device token registration (kept here as it's user-specific)
   async registerDeviceToken(deviceToken: string, platform: 'IOS' | 'ANDROID') {
     const response = await apiClient.post('/notifications/register', {
       device_token: deviceToken,
       platform,
     });
-    return response;
-  }
-
-  async updateNotificationSettings(settings: any) {
-    const response = await apiClient.put('/notifications/settings', settings);
-    return response;
-  }
-
-  async getNotificationSettings() {
-    const response = await apiClient.get('/notifications/settings');
     return response;
   }
 }

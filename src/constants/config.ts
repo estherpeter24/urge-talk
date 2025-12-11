@@ -1,6 +1,6 @@
 export const API_CONFIG = {
-  BASE_URL: __DEV__ ? 'http://172.20.10.3:8080/api' : 'https://api.urge.app',
-  SOCKET_URL: __DEV__ ? 'http://172.20.10.3:8080' : 'https://api.urge.app',
+  BASE_URL: __DEV__ ? 'http://localhost:8080/api' : 'https://api.urge.app',
+  SOCKET_URL: __DEV__ ? 'http://localhost:8080' : 'https://api.urge.app',
   TIMEOUT: 30000,
   MAX_RETRIES: 3,
 };
@@ -32,6 +32,21 @@ export const MEDIA_CONFIG = {
   SUPPORTED_DOCUMENT_FORMATS: ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'],
 };
 
+export const S3_CONFIG = {
+  // S3 bucket configuration - URLs are fetched via presigned URLs from backend
+  BUCKET_NAME: 'mycoursemateresourcenew',
+  REGION: 'eu-north-1',
+  // CDN URL for serving media (direct S3 URL if no CloudFront)
+  CDN_URL: 'https://mycoursemateresourcenew.s3.eu-north-1.amazonaws.com',
+  // Folder prefixes for organizing uploads
+  FOLDERS: {
+    AVATARS: 'avatars',
+    MEDIA: 'media',
+    DOCUMENTS: 'documents',
+    VOICE: 'voice',
+  },
+};
+
 export const APP_CONFIG = {
   APP_NAME: 'URGE',
   VERSION: '1.0.0',
@@ -40,3 +55,6 @@ export const APP_CONFIG = {
   PRIVACY_POLICY_URL: 'https://urge.app/privacy',
   TERMS_URL: 'https://urge.app/terms',
 };
+
+// Paystack configuration (test mode)
+export const PAYSTACK_PUBLIC_KEY = 'pk_test_b50eb13e278f7d780809ee5bceae2f2440994d6c';

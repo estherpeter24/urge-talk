@@ -16,7 +16,7 @@ import { useNavigation } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { STORAGE_KEYS } from '../../constants/config';
 import { NotificationSettings } from '../../types';
-import { userService } from '../../services/api/userService';
+import { settingsService } from '../../services/api/settingsService';
 
 const NotificationsScreen = () => {
   const { theme } = useTheme();
@@ -42,7 +42,7 @@ const NotificationsScreen = () => {
     setIsLoading(true);
     try {
       // First try to load from API
-      const response = await userService.getNotificationSettings();
+      const response = await settingsService.getNotificationSettings();
       if (response.data?.settings) {
         const apiSettings: NotificationSettings = {
           enabled: response.data.settings.enabled,
@@ -87,7 +87,7 @@ const NotificationsScreen = () => {
         message_notifications: newSettings.messageNotifications,
         group_notifications: newSettings.groupNotifications,
       };
-      await userService.updateNotificationSettings(apiPayload);
+      await settingsService.updateNotificationSettings(apiPayload);
 
       // Also save to local storage as cache
       await AsyncStorage.setItem(

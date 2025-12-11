@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -7,27 +7,57 @@ import {
   TouchableOpacity,
   ScrollView,
   SafeAreaView,
+  ActivityIndicator,
 } from 'react-native';
 import Icon from 'react-native-vector-icons/Ionicons';
 import { useNavigation } from '@react-navigation/native';
 import { useTheme } from '../../context/ThemeContext';
 import { useModal } from '../../context/ModalContext';
-import { mockUsers, User } from '../../data/mockData';
+import { useAuth } from '../../context/AuthContext';
+import { groupService } from '../../services/api/groupService';
+import { userService } from '../../services/api/userService';
+import { User } from '../../types';
 
 const CreateGroupScreen = () => {
   const navigation = useNavigation();
   const { theme } = useTheme();
   const { showError, showSuccess } = useModal();
+  const { user: currentUser } = useAuth();
   const [groupName, setGroupName] = useState('');
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
+  const [appUsers, setAppUsers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
 
-  // Get all users except current user
-  const availableUsers = Object.values(mockUsers).filter(user => user.id !== 'current');
+  // Load app users on mount
+  useEffect(() => {
+    loadAppUsers();
+  }, []);
+
+  const loadAppUsers = async () => {
+    try {
+      setLoading(true);
+      const response = await userService.getAllUsers(100, 0);
+      if (response.success && response.data) {
+        // Filter out current user from the list
+        const users = (response.data.users || response.data || []).filter(
+          (u: User) => u.id !== currentUser?.id
+        );
+        setAppUsers(users);
+      }
+    } catch (error) {
+      console.error('Failed to load users:', error);
+      showError('Error', 'Failed to load users');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   // Filter users based on search
-  const filteredUsers = availableUsers.filter(user =>
-    user.name.toLowerCase().includes(searchQuery.toLowerCase())
+  const filteredUsers = appUsers.filter(user =>
+    (user.displayName?.toLowerCase() || '').includes(searchQuery.toLowerCase()) ||
+    (user.phoneNumber || '').includes(searchQuery)
   );
 
   const toggleMember = (userId: string) => {
@@ -38,7 +68,7 @@ const CreateGroupScreen = () => {
     );
   };
 
-  const handleCreateGroup = () => {
+  const handleCreateGroup = async () => {
     if (!groupName.trim()) {
       showError('Error', 'Please enter a group name');
       return;
@@ -49,12 +79,41 @@ const CreateGroupScreen = () => {
       return;
     }
 
-    // Success message
-    showSuccess(
-      'Success',
-      `Group "${groupName}" created with ${selectedMembers.length} members!`,
-      () => navigation.goBack()
-    );
+    setCreating(true);
+    try {
+      const response = await groupService.createGroup({
+        name: groupName.trim(),
+        member_ids: selectedMembers,
+        is_public: false,
+        allow_member_invites: true,
+        require_admin_approval: false,
+      });
+
+      if (response.success) {
+        showSuccess(
+          'Success',
+          `Group "${groupName}" created successfully!`,
+          () => navigation.goBack()
+        );
+      } else {
+        showError('Error', response.message || 'Failed to create group');
+      }
+    } catch (error: any) {
+      console.error('Create group error:', error);
+      const errorMessage = error?.message || 'Failed to create group';
+      showError('Error', errorMessage);
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const getUserDisplayName = (user: User): string => {
+    return user.displayName || user.phoneNumber || 'Unknown User';
+  };
+
+  const getUserInitial = (user: User): string => {
+    const name = getUserDisplayName(user);
+    return name.charAt(0).toUpperCase();
   };
 
   return (
@@ -99,7 +158,7 @@ const CreateGroupScreen = () => {
           <Icon name="search" size={20} color={theme.textSecondary} style={styles.searchIcon} />
           <TextInput
             style={[styles.searchInput, { color: theme.text }]}
-            placeholder="Search contacts..."
+            placeholder="Search users..."
             placeholderTextColor={theme.textSecondary}
             value={searchQuery}
             onChangeText={setSearchQuery}
@@ -111,60 +170,93 @@ const CreateGroupScreen = () => {
           )}
         </View>
 
-        {/* Contact List */}
+        {/* User List */}
         <View style={styles.contactList}>
           <Text style={[styles.sectionTitle, { color: theme.textSecondary }]}>
-            SELECT CONTACTS
+            SELECT MEMBERS
           </Text>
-          {filteredUsers.map(user => (
-            <TouchableOpacity
-              key={user.id}
-              style={[
-                styles.contactItem,
-                { backgroundColor: theme.surface, borderBottomColor: theme.border },
-              ]}
-              onPress={() => toggleMember(user.id)}
-            >
-              <View style={[styles.avatar, { backgroundColor: theme.primary }]}>
-                <Text style={styles.avatarText}>
-                  {user.name.charAt(0).toUpperCase()}
-                </Text>
-              </View>
-              <View style={styles.contactInfo}>
-                <Text style={[styles.contactName, { color: theme.text }]}>
-                  {user.name}
-                </Text>
-                <Text style={[styles.contactPhone, { color: theme.textSecondary }]}>
-                  {user.phoneNumber}
-                </Text>
-              </View>
-              <View
+
+          {loading ? (
+            <View style={styles.loadingContainer}>
+              <ActivityIndicator size="large" color={theme.primary} />
+              <Text style={[styles.loadingText, { color: theme.textSecondary }]}>
+                Loading users...
+              </Text>
+            </View>
+          ) : filteredUsers.length === 0 ? (
+            <View style={styles.emptyContainer}>
+              <Icon name="people-outline" size={48} color={theme.textSecondary} />
+              <Text style={[styles.emptyText, { color: theme.textSecondary }]}>
+                {searchQuery ? 'No users found' : 'No users available'}
+              </Text>
+            </View>
+          ) : (
+            filteredUsers.map(user => (
+              <TouchableOpacity
+                key={user.id}
                 style={[
-                  styles.checkbox,
-                  {
-                    borderColor: selectedMembers.includes(user.id) ? theme.primary : theme.border,
-                    backgroundColor: selectedMembers.includes(user.id) ? theme.primary : 'transparent',
-                  },
+                  styles.contactItem,
+                  { backgroundColor: theme.surface, borderBottomColor: theme.border },
                 ]}
+                onPress={() => toggleMember(user.id)}
               >
-                {selectedMembers.includes(user.id) && (
-                  <Icon name="checkmark" size={16} color="#FFFFFF" />
+                <View style={[styles.avatar, { backgroundColor: theme.primary }]}>
+                  <Text style={styles.avatarText}>
+                    {getUserInitial(user)}
+                  </Text>
+                </View>
+                <View style={styles.contactInfo}>
+                  <Text style={[styles.contactName, { color: theme.text }]}>
+                    {getUserDisplayName(user)}
+                  </Text>
+                  {user.phoneNumber && (
+                    <Text style={[styles.contactPhone, { color: theme.textSecondary }]}>
+                      {user.phoneNumber}
+                    </Text>
+                  )}
+                </View>
+                {user.isOnline && (
+                  <View style={[styles.onlineIndicator, { backgroundColor: theme.success || '#4CAF50' }]} />
                 )}
-              </View>
-            </TouchableOpacity>
-          ))}
+                <View
+                  style={[
+                    styles.checkbox,
+                    {
+                      borderColor: selectedMembers.includes(user.id) ? theme.primary : theme.border,
+                      backgroundColor: selectedMembers.includes(user.id) ? theme.primary : 'transparent',
+                    },
+                  ]}
+                >
+                  {selectedMembers.includes(user.id) && (
+                    <Icon name="checkmark" size={16} color="#FFFFFF" />
+                  )}
+                </View>
+              </TouchableOpacity>
+            ))
+          )}
         </View>
       </ScrollView>
 
       {/* Create Button */}
-      {selectedMembers.length > 0 && groupName.trim().length > 0 && (
+      {groupName.trim().length > 0 && selectedMembers.length > 0 && (
         <View style={[styles.footer, { backgroundColor: theme.surface, borderTopColor: theme.border }]}>
           <TouchableOpacity
-            style={[styles.createButton, { backgroundColor: theme.primary }]}
+            style={[
+              styles.createButton,
+              { backgroundColor: theme.primary },
+              creating && styles.buttonDisabled,
+            ]}
             onPress={handleCreateGroup}
+            disabled={creating}
           >
-            <Icon name="checkmark-circle" size={24} color="#FFFFFF" />
-            <Text style={styles.createButtonText}>Create Group</Text>
+            {creating ? (
+              <ActivityIndicator size="small" color="#FFFFFF" />
+            ) : (
+              <>
+                <Icon name="checkmark-circle" size={24} color="#FFFFFF" />
+                <Text style={styles.createButtonText}>Create Group</Text>
+              </>
+            )}
           </TouchableOpacity>
         </View>
       )}
@@ -241,6 +333,24 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     letterSpacing: 0.5,
   },
+  loadingContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 40,
+  },
+  loadingText: {
+    marginTop: 12,
+    fontSize: 14,
+  },
+  emptyContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 40,
+  },
+  emptyText: {
+    marginTop: 12,
+    fontSize: 14,
+  },
   contactItem: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -272,6 +382,12 @@ const styles = StyleSheet.create({
   contactPhone: {
     fontSize: 14,
   },
+  onlineIndicator: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    marginRight: 12,
+  },
   checkbox: {
     width: 24,
     height: 24,
@@ -292,6 +408,9 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     borderRadius: 8,
     gap: 8,
+  },
+  buttonDisabled: {
+    opacity: 0.7,
   },
   createButtonText: {
     color: '#FFFFFF',

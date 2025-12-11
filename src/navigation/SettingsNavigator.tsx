@@ -7,6 +7,9 @@ import PrivacyScreen from '../screens/settings/PrivacyScreen';
 import HelpSupportScreen from '../screens/settings/HelpSupportScreen';
 import TermsPrivacyScreen from '../screens/settings/TermsPrivacyScreen';
 import LanguageScreen from '../screens/settings/LanguageScreen';
+import SubscriptionsScreen from '../screens/settings/SubscriptionsScreen';
+import VerificationScreen from '../screens/settings/VerificationScreen';
+import SocialMediaScreen from '../screens/settings/SocialMediaScreen';
 
 const Stack = createNativeStackNavigator<SettingsStackParamList>();
 
@@ -23,6 +26,9 @@ const SettingsNavigator = () => {
       <Stack.Screen name="HelpSupport" component={HelpSupportScreen} />
       <Stack.Screen name="TermsPrivacy" component={TermsPrivacyScreen} />
       <Stack.Screen name="Language" component={LanguageScreen} />
+      <Stack.Screen name="Subscriptions" component={SubscriptionsScreen} />
+      <Stack.Screen name="Verification" component={VerificationScreen} />
+      <Stack.Screen name="SocialMedia" component={SocialMediaScreen} />
     </Stack.Navigator>
   );
 };

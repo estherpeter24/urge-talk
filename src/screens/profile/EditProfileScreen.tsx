@@ -10,6 +10,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   Image,
+  ActivityIndicator,
 } from 'react-native';
 import Icon from 'react-native-vector-icons/Ionicons';
 import { launchImageLibrary, launchCamera, ImagePickerResponse } from 'react-native-image-picker';
@@ -17,6 +18,7 @@ import { useTheme } from '../../context/ThemeContext';
 import { useAuth } from '../../context/AuthContext';
 import { useModal } from '../../context/ModalContext';
 import { useNavigation } from '@react-navigation/native';
+import { userService, mediaService } from '../../services/api';
 
 const EditProfileScreen = () => {
   const { theme } = useTheme();
@@ -30,7 +32,8 @@ const EditProfileScreen = () => {
   const [instagram, setInstagram] = useState(user?.socialLinks?.instagram || '');
   const [twitter, setTwitter] = useState(user?.socialLinks?.twitter || '');
   const [linkedin, setLinkedin] = useState(user?.socialLinks?.linkedin || '');
-  const [profileImage, setProfileImage] = useState<string | null>(user?.profileImage || null);
+  const [profileImage, setProfileImage] = useState<string | null>(user?.avatar || null);
+  const [newImageUri, setNewImageUri] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const handleImagePicker = () => {
@@ -80,6 +83,7 @@ const EditProfileScreen = () => {
       const asset = response.assets[0];
       if (asset.uri) {
         setProfileImage(asset.uri);
+        setNewImageUri(asset.uri);
         showSuccess('Success', 'Profile photo updated! Don\'t forget to save.');
       }
     }
@@ -93,23 +97,60 @@ const EditProfileScreen = () => {
 
     setLoading(true);
     try {
-      await updateUser({
-        displayName: displayName.trim(),
-        email: email.trim() || undefined,
-        bio: bio.trim() || undefined,
-        profileImage: profileImage || undefined,
-        socialLinks: {
-          instagram: instagram.trim() || undefined,
-          twitter: twitter.trim() || undefined,
-          linkedin: linkedin.trim() || undefined,
-        },
-      });
+      let avatarUrl = profileImage;
 
-      showSuccess('Success', 'Profile updated successfully', () => {
-        navigation.goBack();
-      });
-    } catch (error) {
-      showError('Error', 'Failed to update profile');
+      // Upload new profile image if changed
+      if (newImageUri) {
+        try {
+          const uploadResponse = await mediaService.uploadImage(newImageUri, 'avatar');
+          if (uploadResponse.success && uploadResponse.data?.url) {
+            avatarUrl = uploadResponse.data.url;
+          }
+        } catch (uploadError) {
+          console.error('Image upload error:', uploadError);
+          // Continue with save even if image upload fails
+        }
+      }
+
+      // Prepare profile data for backend (snake_case)
+      const profileData = {
+        display_name: displayName.trim(),
+        email: email.trim() || null,
+        bio: bio.trim() || null,
+        avatar_url: avatarUrl,
+        social_links: {
+          instagram: instagram.trim() || null,
+          twitter: twitter.trim() || null,
+          linkedin: linkedin.trim() || null,
+        },
+      };
+
+      // Save to backend API
+      const response = await userService.updateProfile(profileData);
+
+      if (response.success) {
+        // Also update local state
+        await updateUser({
+          displayName: displayName.trim(),
+          email: email.trim() || undefined,
+          bio: bio.trim() || undefined,
+          avatar: avatarUrl || undefined,
+          socialLinks: {
+            instagram: instagram.trim() || undefined,
+            twitter: twitter.trim() || undefined,
+            linkedin: linkedin.trim() || undefined,
+          },
+        });
+
+        showSuccess('Success', 'Profile updated successfully', () => {
+          navigation.goBack();
+        });
+      } else {
+        showError('Error', response.message || 'Failed to update profile');
+      }
+    } catch (error: any) {
+      console.error('Profile update error:', error);
+      showError('Error', error.message || 'Failed to update profile');
     } finally {
       setLoading(false);
     }

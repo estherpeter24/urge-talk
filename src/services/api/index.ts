@@ -5,6 +5,8 @@ export { messageService } from './messageService';
 export { groupService } from './groupService';
 export { mediaService } from './mediaService';
 export { userService } from './userService';
+export { settingsService } from './settingsService';
+export { accountService } from './accountService';
 export { apiClient } from './client';
 
 // Export types
@@ -24,3 +26,10 @@ export type {
 } from './groupService';
 export type { MediaUploadResponse } from './mediaService';
 export type { UserSearchResponse, UserStatusResponse } from './userService';
+export type {
+  SubscriptionPlan,
+  SubscriptionResponse,
+  VerificationStatusResponse,
+  VerificationRequest,
+  SocialLinks,
+} from './accountService';

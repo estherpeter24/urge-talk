@@ -63,11 +63,7 @@ const ChatNavigator = () => {
         name="GroupInfo"
         component={GroupInfoScreen}
         options={{
-          title: 'Group Info',
-          headerStyle: {
-            backgroundColor: theme.surface,
-          },
-          headerTintColor: theme.text,
+          headerShown: false,
         }}
       />
       <Stack.Screen

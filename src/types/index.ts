@@ -1,10 +1,49 @@
-// User Role Types
+// User Role Types (App-wide)
 export enum UserRole {
   FOUNDER = 'FOUNDER',
   CO_FOUNDER = 'CO_FOUNDER',
   VERIFIED = 'VERIFIED',
   REGULAR = 'REGULAR',
 }
+
+// Group Member Role Types
+export enum GroupMemberRole {
+  FOUNDER = 'FOUNDER',           // Original creator, has all permissions
+  ACCOUNTANT = 'ACCOUNTANT',     // Co-founder: manages finances
+  MODERATOR = 'MODERATOR',       // Co-founder: upholds ethics/moderation
+  RECRUITER = 'RECRUITER',       // Co-founder: vets who gets into community
+  SUPPORT = 'SUPPORT',           // Co-founder: helps members with challenges
+  CHEERLEADER = 'CHEERLEADER',   // Co-founder: keeps community active
+  MEMBER = 'MEMBER',             // Regular member
+}
+
+// Role display names
+export const GROUP_ROLE_DISPLAY: Record<GroupMemberRole, string> = {
+  [GroupMemberRole.FOUNDER]: 'Founder',
+  [GroupMemberRole.ACCOUNTANT]: 'Accountant (Co-founder)',
+  [GroupMemberRole.MODERATOR]: 'Moderator (Co-founder)',
+  [GroupMemberRole.RECRUITER]: 'Recruiter (Co-founder)',
+  [GroupMemberRole.SUPPORT]: 'Support (Co-founder)',
+  [GroupMemberRole.CHEERLEADER]: 'Cheer Leader (Co-founder)',
+  [GroupMemberRole.MEMBER]: 'Member',
+};
+
+// Helper to check if role is co-founder
+export const isCofounderRole = (role: GroupMemberRole | string): boolean => {
+  const cofounderRoles = [
+    GroupMemberRole.ACCOUNTANT,
+    GroupMemberRole.MODERATOR,
+    GroupMemberRole.RECRUITER,
+    GroupMemberRole.SUPPORT,
+    GroupMemberRole.CHEERLEADER,
+  ];
+  return cofounderRoles.includes(role as GroupMemberRole);
+};
+
+// Helper to check if role has admin privileges
+export const isAdminRole = (role: GroupMemberRole | string): boolean => {
+  return role === GroupMemberRole.FOUNDER || isCofounderRole(role);
+};
 
 // User Interface
 export interface User {
@@ -38,6 +77,9 @@ export enum MessageType {
   AUDIO = 'AUDIO',
   DOCUMENT = 'DOCUMENT',
   LOCATION = 'LOCATION',
+  CONTACT = 'CONTACT',
+  VOICE = 'VOICE',
+  SYSTEM = 'SYSTEM',
 }
 
 export enum MessageStatus {
@@ -46,6 +88,13 @@ export enum MessageStatus {
   DELIVERED = 'DELIVERED',
   READ = 'READ',
   FAILED = 'FAILED',
+}
+
+// Reply To Interface for message replies
+export interface ReplyTo {
+  id: string;
+  senderName: string;
+  content: string;
 }
 
 // Message Interface
@@ -62,11 +111,16 @@ export interface Message {
   thumbnailUrl?: string;
   audioPath?: string;
   audioDuration?: number;
-  replyTo?: string;
+  replyTo?: ReplyTo;
   isEncrypted: boolean;
+  isForwarded?: boolean;
   createdAt: Date;
   updatedAt: Date;
   deletedAt?: Date;
+  // For optimistic media uploads (WhatsApp-style loading)
+  localUri?: string;
+  isUploading?: boolean;
+  uploadProgress?: number;
 }
 
 // Conversation Types
@@ -80,6 +134,7 @@ export interface ParticipantInfo {
   display_name: string;
   avatar_url?: string;
   is_online: boolean;
+  phone_number?: string;
 }
 
 export interface Conversation {
@@ -138,6 +193,7 @@ export interface AuthCredentials {
   phoneNumber: string;
   verificationCode?: string;
   password?: string;
+  displayName?: string;
 }
 
 export interface AuthResponse {
@@ -200,6 +256,7 @@ export type RootStackParamList = {
   Splash: undefined;
   Auth: undefined;
   Main: undefined;
+  JoinGroup: { inviteCode: string };
 };
 
 export type AuthStackParamList = {
@@ -220,7 +277,7 @@ export type MainTabParamList = {
 
 export type ChatStackParamList = {
   ChatList: undefined;
-  ChatRoom: { conversationId: string; recipientName: string };
+  ChatRoom: { conversationId: string; recipientName: string; recipientPhone?: string };
   NewChat: undefined;
   GroupChat: { groupId: string };
   GroupInfo: { groupId: string };
@@ -241,6 +298,9 @@ export type SettingsStackParamList = {
   HelpSupport: undefined;
   TermsPrivacy: undefined;
   Language: undefined;
+  Subscriptions: undefined;
+  Verification: undefined;
+  SocialMedia: undefined;
 };
 
 // Socket Events
@@ -255,6 +315,7 @@ export enum SocketEvent {
   TYPING_STOP = 'typing:stop',
   USER_ONLINE = 'user:online',
   USER_OFFLINE = 'user:offline',
+  GROUP_DELETED = 'group:deleted',
 }
 
 // Media Upload Types

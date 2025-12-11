@@ -1,8 +1,22 @@
 /**
+ * Parse a date string as UTC if it doesn't have timezone info
+ */
+export const parseAsUTC = (date: Date | string): Date => {
+  if (typeof date === 'string') {
+    // If the string doesn't end with Z or timezone offset, treat it as UTC
+    if (!date.endsWith('Z') && !date.match(/[+-]\d{2}:\d{2}$/)) {
+      return new Date(date + 'Z');
+    }
+    return new Date(date);
+  }
+  return date;
+};
+
+/**
  * Format a timestamp for chat messages
  */
 export const formatChatTimestamp = (date: Date | string): string => {
-  const timestamp = typeof date === 'string' ? new Date(date) : date;
+  const timestamp = parseAsUTC(date);
   const now = new Date();
   const diffMs = now.getTime() - timestamp.getTime();
   const diffMins = Math.floor(diffMs / (1000 * 60));
@@ -28,7 +42,7 @@ export const formatChatTimestamp = (date: Date | string): string => {
  * Format a relative time (e.g., "2 hours ago", "3 days ago")
  */
 export const formatRelativeTime = (date: Date | string): string => {
-  const timestamp = typeof date === 'string' ? new Date(date) : date;
+  const timestamp = parseAsUTC(date);
   const now = new Date();
   const diffMs = now.getTime() - timestamp.getTime();
 
@@ -61,7 +75,7 @@ export const formatRelativeTime = (date: Date | string): string => {
  * Format time in HH:MM format
  */
 export const formatTime = (date: Date | string): string => {
-  const timestamp = typeof date === 'string' ? new Date(date) : date;
+  const timestamp = parseAsUTC(date);
   return timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 };
 
@@ -69,7 +83,7 @@ export const formatTime = (date: Date | string): string => {
  * Format date in readable format
  */
 export const formatDate = (date: Date | string, format: 'short' | 'long' = 'short'): string => {
-  const timestamp = typeof date === 'string' ? new Date(date) : date;
+  const timestamp = parseAsUTC(date);
 
   if (format === 'long') {
     return timestamp.toLocaleDateString([], {

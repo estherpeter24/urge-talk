@@ -1,8 +1,11 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { DeviceEventEmitter } from 'react-native';
 import { User, AuthResponse, AuthCredentials } from '../types';
 import { authService } from '../services/api/authService';
 import { STORAGE_KEYS } from '../constants/config';
+import { AUTH_LOGOUT_EVENT } from '../services/api/client';
+import { pushNotificationService } from '../services/pushNotification';
 
 interface AuthContextType {
   user: User | null;
@@ -25,6 +28,17 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   useEffect(() => {
     loadStoredAuth();
+
+    // Listen for forced logout events from API client (e.g., when token refresh fails)
+    const subscription = DeviceEventEmitter.addListener(AUTH_LOGOUT_EVENT, () => {
+      console.log('Received AUTH_LOGOUT_EVENT - clearing auth state');
+      setToken(null);
+      setUser(null);
+    });
+
+    return () => {
+      subscription.remove();
+    };
   }, []);
 
   const loadStoredAuth = async () => {
@@ -33,8 +47,43 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       const storedUser = await AsyncStorage.getItem(STORAGE_KEYS.USER_DATA);
 
       if (storedToken && storedUser) {
-        setToken(storedToken);
-        setUser(JSON.parse(storedUser));
+        // Verify the token is still valid by making a quick API call
+        try {
+          const response = await fetch(`${require('../constants/config').API_CONFIG.BASE_URL}/auth/me`, {
+            headers: {
+              'Authorization': `Bearer ${storedToken}`,
+            },
+          });
+
+          if (response.ok) {
+            // Token is valid
+            setToken(storedToken);
+            setUser(JSON.parse(storedUser));
+
+            // Initialize push notifications for returning user
+            pushNotificationService.initialize().catch((error) => {
+              console.error('Failed to initialize push notifications:', error);
+            });
+          } else {
+            // Token is invalid - clear stored auth
+            console.log('Stored token is invalid, clearing auth');
+            await AsyncStorage.multiRemove([
+              STORAGE_KEYS.AUTH_TOKEN,
+              STORAGE_KEYS.REFRESH_TOKEN,
+              STORAGE_KEYS.USER_DATA,
+            ]);
+          }
+        } catch (fetchError) {
+          // Network error - use stored data optimistically
+          console.log('Could not verify token, using stored auth:', fetchError);
+          setToken(storedToken);
+          setUser(JSON.parse(storedUser));
+
+          // Initialize push notifications for returning user
+          pushNotificationService.initialize().catch((error) => {
+            console.error('Failed to initialize push notifications:', error);
+          });
+        }
       }
     } catch (error) {
       console.error('Error loading auth:', error);
@@ -51,6 +100,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       setToken(authData.token);
       setUser(authData.user);
+
+      // Initialize push notifications after successful authentication
+      pushNotificationService.initialize().catch((error) => {
+        console.error('Failed to initialize push notifications:', error);
+      });
     } catch (error) {
       console.error('Error saving auth:', error);
       throw error;
@@ -78,8 +132,10 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   };
 
   const verifyPhone = async (phoneNumber: string, code: string) => {
+    console.log('[AuthContext] verifyPhone called with phoneNumber:', phoneNumber, 'code length:', code?.length);
     try {
-      const response = await authService.verifyPhone(phoneNumber, code);
+      // Use login with verification code for existing users
+      const response = await authService.login({ phoneNumber, verificationCode: code });
       await saveAuth(response);
     } catch (error) {
       console.error('Verification error:', error);
@@ -89,6 +145,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   const logout = async () => {
     try {
+      // Unregister push notification token before logout
+      await pushNotificationService.unregisterToken();
+
       await AsyncStorage.multiRemove([
         STORAGE_KEYS.AUTH_TOKEN,
         STORAGE_KEYS.REFRESH_TOKEN,

@@ -1,7 +1,11 @@
 import axios, { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { DeviceEventEmitter } from 'react-native';
 import { API_CONFIG, STORAGE_KEYS } from '../../constants/config';
 import { ApiResponse } from '../../types';
+
+// Event name for auth session expiry
+export const AUTH_LOGOUT_EVENT = 'AUTH_LOGOUT_EVENT';
 
 class ApiClient {
   private client: AxiosInstance;
@@ -39,13 +43,21 @@ class ApiClient {
       async (error) => {
         const originalRequest = error.config;
 
-        // Handle 401 Unauthorized - refresh token
-        if (error.response?.status === 401 && !originalRequest._retry) {
+        // Don't try to refresh tokens for auth endpoints (login, register, etc.)
+        const isAuthEndpoint = originalRequest.url?.includes('/auth/');
+
+        // Handle 401 Unauthorized - refresh token (but not for auth endpoints)
+        if (error.response?.status === 401 && !originalRequest._retry && !isAuthEndpoint) {
           originalRequest._retry = true;
 
           try {
             const refreshToken = await AsyncStorage.getItem(STORAGE_KEYS.REFRESH_TOKEN);
-            const response = await this.client.post('/auth/refresh', { refreshToken });
+            // Only attempt refresh if we have a token
+            if (!refreshToken) {
+              return Promise.reject(error);
+            }
+            // Send as refresh_token (snake_case) to match backend expectation
+            const response = await this.client.post('/auth/refresh', { refresh_token: refreshToken });
 
             const { access_token } = response.data;
             await AsyncStorage.setItem(STORAGE_KEYS.AUTH_TOKEN, access_token);
@@ -59,6 +71,8 @@ class ApiClient {
               STORAGE_KEYS.REFRESH_TOKEN,
               STORAGE_KEYS.USER_DATA,
             ]);
+            // Emit event to notify AuthContext to clear state
+            DeviceEventEmitter.emit(AUTH_LOGOUT_EVENT);
             return Promise.reject(refreshError);
           }
         }
@@ -149,12 +163,25 @@ class ApiClient {
 
   private handleError(error: any): ApiResponse<any> {
     if (error.response) {
+      // Handle FastAPI validation errors (detail is an array of {type, loc, msg, input})
+      let errorMessage = 'Server error occurred';
+      const detail = error.response.data?.detail;
+
+      if (typeof detail === 'string') {
+        errorMessage = detail;
+      } else if (Array.isArray(detail) && detail.length > 0) {
+        // Extract msg from first validation error
+        errorMessage = detail[0]?.msg || 'Validation error';
+      } else if (error.response.data?.message) {
+        errorMessage = error.response.data.message;
+      }
+
       return {
         success: false,
-        message: error.response.data?.detail || error.response.data?.message || 'Server error occurred',
+        message: errorMessage,
         error: {
           code: error.response.status.toString(),
-          message: error.response.data?.detail || error.response.data?.message || 'Server error',
+          message: errorMessage,
           details: error.response.data,
         },
       };

@@ -63,12 +63,35 @@ class AuthService {
       throw new Error('Invalid phone number or password. Use: +1234567890 / password123');
     }
 
+    // Validate phone number is provided
+    if (!credentials.phoneNumber || typeof credentials.phoneNumber !== 'string') {
+      console.error('[AuthService] Invalid phone number:', credentials.phoneNumber);
+      throw new Error('Phone number is required');
+    }
+
+    // Trim phone number to remove any leading/trailing whitespace
+    const trimmedPhone = credentials.phoneNumber.trim();
+
+    // Validate that at least one auth method is provided
+    if (!credentials.verificationCode && !credentials.password) {
+      console.error('[AuthService] No auth method provided. verificationCode:', credentials.verificationCode, 'password:', !!credentials.password);
+      throw new Error('Verification code or password is required');
+    }
+
     // Convert camelCase to snake_case for backend
-    const payload = {
-      phone_number: credentials.phoneNumber,
-      password: credentials.password,
+    // Support verification code login (primary) or password (fallback)
+    const payload: Record<string, string> = {
+      phone_number: trimmedPhone,
     };
 
+    if (credentials.verificationCode) {
+      payload.verification_code = credentials.verificationCode;
+    }
+    if (credentials.password) {
+      payload.password = credentials.password;
+    }
+
+    console.log('[AuthService] Login payload:', JSON.stringify(payload));
     const response = await apiClient.post<any>('/auth/login', payload);
     if (!response.success || !response.data) {
       throw new Error(response.message || 'Login failed');
@@ -77,7 +100,7 @@ class AuthService {
     // Convert snake_case response to camelCase
     return {
       user: transformUser(response.data.user),
-      token: response.data.token,
+      token: response.data.access_token,
       refreshToken: response.data.refresh_token,
     };
   }
@@ -98,7 +121,7 @@ class AuthService {
     // Convert snake_case response to camelCase
     return {
       user: transformUser(response.data.user),
-      token: response.data.token,
+      token: response.data.access_token,
       refreshToken: response.data.refresh_token,
     };
   }
@@ -121,7 +144,7 @@ class AuthService {
   }
 
   async sendVerificationCode(phoneNumber: string): Promise<void> {
-    const response = await apiClient.post('/auth/send-code', {
+    const response = await apiClient.post('/auth/send-verification', {
       phone_number: phoneNumber,
     });
     if (!response.success) {
@@ -129,24 +152,28 @@ class AuthService {
     }
   }
 
-  async forgotPassword(phoneNumber: string): Promise<void> {
+  async forgotPassword(phoneNumber: string): Promise<{ success: boolean; message?: string }> {
     const response = await apiClient.post('/auth/forgot-password', {
       phone_number: phoneNumber,
     });
-    if (!response.success) {
-      throw new Error(response.message || 'Failed to send reset code');
-    }
+    return { success: response.success, message: response.message };
   }
 
-  async resetPassword(phoneNumber: string, code: string, newPassword: string): Promise<void> {
+  async verifyResetCode(phoneNumber: string, code: string): Promise<{ success: boolean; message?: string }> {
+    const response = await apiClient.post('/auth/verify-reset-code', {
+      phone_number: phoneNumber,
+      code,
+    });
+    return { success: response.success, message: response.message };
+  }
+
+  async resetPassword(phoneNumber: string, code: string, newPassword: string): Promise<{ success: boolean; message?: string }> {
     const response = await apiClient.post('/auth/reset-password', {
       phone_number: phoneNumber,
       code,
       new_password: newPassword,
     });
-    if (!response.success) {
-      throw new Error(response.message || 'Failed to reset password');
-    }
+    return { success: response.success, message: response.message };
   }
 
   async updateProfile(userData: Partial<User>): Promise<User> {

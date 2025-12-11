@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -18,10 +18,11 @@ import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useTheme } from '../../context/ThemeContext';
 import { useModal } from '../../context/ModalContext';
-import { ChatStackParamList, Conversation, ConversationType } from '../../types';
-import { Theme } from '../../constants/theme';
+import { ChatStackParamList, Conversation, ConversationType, SocketEvent, Message } from '../../types';
+import { Colors } from '../../constants/colors';
 import { conversationService } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
+import { socketService } from '../../services/socket/socketService';
 
 type ChatListNavigationProp = NativeStackNavigationProp<ChatStackParamList, 'ChatList'>;
 type FilterType = 'All' | 'Unread' | 'Favourite';
@@ -110,13 +111,70 @@ const ChatListScreen = () => {
     }, [])
   );
 
+  // Listen for new messages via socket to update conversation list in real-time
+  useEffect(() => {
+    const handleNewMessage = (message: Message) => {
+      console.log('[ChatListScreen] Received new message via socket:', message);
+
+      // Get conversation ID from the message
+      const conversationId = message.conversationId || message.conversation_id;
+      if (!conversationId) return;
+
+      setConversations(prevConversations => {
+        // Find the conversation this message belongs to
+        const existingConvIndex = prevConversations.findIndex(c => c.id === conversationId);
+
+        if (existingConvIndex >= 0) {
+          // Update existing conversation
+          const updatedConversations = [...prevConversations];
+          const conv = { ...updatedConversations[existingConvIndex] };
+
+          // Update last message
+          conv.lastMessage = {
+            id: message.id,
+            content: message.content,
+            messageType: message.messageType || message.message_type || 'TEXT',
+            createdAt: message.createdAt || message.created_at || new Date().toISOString(),
+            senderId: message.senderId || message.sender_id,
+          };
+
+          // Increment unread count if message is from another user
+          const currentUserId = user?.id;
+          const senderId = message.senderId || message.sender_id;
+          if (currentUserId && senderId !== currentUserId) {
+            conv.unreadCount = (conv.unreadCount || 0) + 1;
+          }
+
+          // Remove from current position
+          updatedConversations.splice(existingConvIndex, 1);
+          // Add to top of list (most recent)
+          updatedConversations.unshift(conv);
+
+          return updatedConversations;
+        } else {
+          // New conversation - reload the list to get full details
+          loadConversations();
+          return prevConversations;
+        }
+      });
+    };
+
+    // Subscribe to message:received events
+    socketService.addEventListener(SocketEvent.MESSAGE_RECEIVED, handleNewMessage);
+
+    // Cleanup on unmount
+    return () => {
+      socketService.removeEventListener(SocketEvent.MESSAGE_RECEIVED, handleNewMessage);
+    };
+  }, [user?.id]);
+
   // Filter conversations based on active filter and search query
   const filteredConversations = conversations.filter((conv) => {
     // Apply search filter
     if (searchQuery) {
       const matchesSearch =
         conv.name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        conv.lastMessage?.content.toLowerCase().includes(searchQuery.toLowerCase());
+        conv.lastMessage?.content?.toLowerCase().includes(searchQuery.toLowerCase());
       if (!matchesSearch) return false;
     }
 
@@ -215,22 +273,45 @@ const ChatListScreen = () => {
   const getConversationDisplayInfo = (conversation: Conversation) => {
     if (conversation.type === ConversationType.DIRECT) {
       // For direct conversations, show the other participant's info
-      const otherParticipant = conversation.participants?.find(p => p.id !== user?.id);
+      // Handle case where user is not yet loaded
+      const currentUserId = user?.id;
+      const otherParticipant = currentUserId
+        ? conversation.participants?.find(p => p.id !== currentUserId)
+        : conversation.participants?.[0];
       return {
-        name: otherParticipant?.display_name || 'Unknown',
+        name: otherParticipant?.display_name || conversation.name || 'Unknown',
         avatar: otherParticipant?.avatar_url,
+        phone: otherParticipant?.phone_number,
       };
     } else {
       // For group conversations, use conversation name and avatar
       return {
         name: conversation.name || 'Group',
         avatar: conversation.avatar,
+        phone: undefined,
       };
     }
   };
 
-  const formatTime = (date: string | Date): string => {
-    const messageDate = typeof date === 'string' ? new Date(date) : date;
+  const formatTime = (date: string | Date | undefined): string => {
+    if (!date) return '';
+
+    // Parse date as UTC if it doesn't have timezone info
+    let messageDate: Date;
+    if (typeof date === 'string') {
+      // If the string doesn't end with Z or timezone offset, treat it as UTC
+      if (!date.endsWith('Z') && !date.match(/[+-]\d{2}:\d{2}$/)) {
+        messageDate = new Date(date + 'Z');
+      } else {
+        messageDate = new Date(date);
+      }
+    } else {
+      messageDate = date;
+    }
+
+    // Handle invalid date
+    if (isNaN(messageDate.getTime())) return '';
+
     const now = new Date();
     const diffMs = now.getTime() - messageDate.getTime();
     const diffMins = Math.floor(diffMs / 60000);
@@ -259,10 +340,18 @@ const ChatListScreen = () => {
           if (isSelectionMode) {
             toggleChatSelection(item.id);
           } else {
-            navigation.navigate('ChatRoom', {
-              conversationId: item.id,
-              recipientName: displayInfo.name,
-            });
+            // Navigate to GroupChat for group conversations, ChatRoom for direct
+            if (item.type === ConversationType.GROUP) {
+              navigation.navigate('GroupChat', {
+                groupId: item.id,
+              });
+            } else {
+              navigation.navigate('ChatRoom', {
+                conversationId: item.id,
+                recipientName: displayInfo.name,
+                recipientPhone: displayInfo.phone,
+              });
+            }
           }
         }}
         onLongPress={() => {
@@ -287,8 +376,16 @@ const ChatListScreen = () => {
           {displayInfo.avatar ? (
             <Image source={{ uri: displayInfo.avatar }} style={styles(theme).avatar} />
           ) : (
-            <View style={[styles(theme).avatar, styles(theme).avatarPlaceholder]}>
-              <Icon name="person" size={24} color={theme.textSecondary} />
+            <View style={[
+              styles(theme).avatar,
+              styles(theme).avatarPlaceholder,
+              item.type === ConversationType.GROUP && { backgroundColor: theme.primary }
+            ]}>
+              <Icon
+                name={item.type === ConversationType.GROUP ? "people" : "person"}
+                size={24}
+                color={item.type === ConversationType.GROUP ? "#FFFFFF" : theme.textSecondary}
+              />
             </View>
           )}
           {item.isTyping && (
@@ -495,7 +592,7 @@ const ChatListScreen = () => {
   );
 };
 
-const styles = (theme: Theme) =>
+const styles = (theme: typeof Colors.light) =>
   StyleSheet.create({
     container: {
       flex: 1,

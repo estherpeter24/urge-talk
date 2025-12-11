@@ -82,7 +82,8 @@ const NewChatScreen = () => {
       // Create a map of phone numbers to users
       const usersByPhone = new Map<string, User>();
       registeredUsers.forEach(user => {
-        const cleanPhone = user.phoneNumber?.replace(/[^0-9+]/g, '');
+        const phoneNumber = user.phoneNumber || '';
+        const cleanPhone = phoneNumber.replace(/[^0-9+]/g, '');
         if (cleanPhone) {
           usersByPhone.set(cleanPhone, user);
         }
@@ -96,7 +97,8 @@ const NewChatScreen = () => {
         const displayName = contact.displayName || contact.givenName || 'Unknown';
 
         contact.phoneNumbers.forEach(phoneObj => {
-          const cleanPhone = phoneObj.number?.replace(/[^0-9+]/g, '');
+          const phoneNumber = phoneObj.number || '';
+          const cleanPhone = phoneNumber.replace(/[^0-9+]/g, '');
           if (cleanPhone && !seenPhones.has(cleanPhone)) {
             seenPhones.add(cleanPhone);
 
@@ -104,7 +106,7 @@ const NewChatScreen = () => {
             contactItems.push({
               id: contact.recordID + '_' + cleanPhone,
               name: displayName,
-              phoneNumber: phoneObj.number,
+              phoneNumber: phoneNumber,
               isRegistered: !!registeredUser,
               user: registeredUser,
             });
@@ -224,7 +226,8 @@ const NewChatScreen = () => {
       // Create a map of phone numbers to users
       const usersByPhone = new Map<string, User>();
       registeredUsers.forEach(user => {
-        const cleanPhone = user.phoneNumber?.replace(/[^0-9+]/g, '');
+        const phoneNumber = user.phoneNumber || '';
+        const cleanPhone = phoneNumber.replace(/[^0-9+]/g, '');
         if (cleanPhone) {
           usersByPhone.set(cleanPhone, user);
         }
@@ -238,7 +241,8 @@ const NewChatScreen = () => {
         const displayName = contact.displayName || contact.givenName || 'Unknown';
 
         contact.phoneNumbers.forEach(phoneObj => {
-          const cleanPhone = phoneObj.number?.replace(/[^0-9+]/g, '');
+          const phoneNumber = phoneObj.number || '';
+          const cleanPhone = phoneNumber.replace(/[^0-9+]/g, '');
           if (cleanPhone && !seenPhones.has(cleanPhone)) {
             seenPhones.add(cleanPhone);
 
@@ -246,7 +250,7 @@ const NewChatScreen = () => {
             contactItems.push({
               id: contact.recordID + '_' + cleanPhone,
               name: displayName,
-              phoneNumber: phoneObj.number,
+              phoneNumber: phoneNumber,
               isRegistered: !!registeredUser,
               user: registeredUser,
             });
@@ -336,7 +340,9 @@ const NewChatScreen = () => {
 
       if (response.success && response.data) {
         const conversation = response.data;
-        navigation.navigate('ChatRoom', {
+        // Use replace instead of navigate to remove NewChatScreen from stack
+        // This way, pressing back from ChatRoom goes directly to ChatListScreen
+        navigation.replace('ChatRoom', {
           conversationId: conversation.id,
           recipientName: user.displayName || 'Unknown',
         });

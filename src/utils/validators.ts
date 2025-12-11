@@ -7,14 +7,44 @@ export const validateEmail = (email: string): boolean => {
 };
 
 /**
- * Validate phone number (supports various formats)
+ * Validate phone number (supports international formats)
  */
 export const validatePhoneNumber = (phoneNumber: string): boolean => {
-  // Remove all non-digit characters
-  const cleaned = phoneNumber.replace(/\D/g, '');
+  // Remove all non-digit characters except +
+  const cleaned = phoneNumber.replace(/[^\d+]/g, '');
 
-  // Check if it's a valid length (10 or 11 digits)
-  return cleaned.length >= 10 && cleaned.length <= 11;
+  // Check for valid phone number patterns:
+  // - Starts with + followed by 10-15 digits (international)
+  // - Or 10-15 digits without + (local)
+  const internationalRegex = /^\+\d{10,15}$/;
+  const localRegex = /^\d{10,15}$/;
+
+  return internationalRegex.test(cleaned) || localRegex.test(cleaned);
+};
+
+/**
+ * Get phone validation error message
+ */
+export const getPhoneValidationError = (phoneNumber: string): string | null => {
+  if (!phoneNumber || phoneNumber.trim().length === 0) {
+    return 'Phone number is required';
+  }
+
+  const cleaned = phoneNumber.replace(/[^\d+]/g, '');
+
+  if (cleaned.length < 10) {
+    return 'Phone number must be at least 10 digits';
+  }
+
+  if (cleaned.length > 15) {
+    return 'Phone number is too long';
+  }
+
+  if (!validatePhoneNumber(phoneNumber)) {
+    return 'Please enter a valid phone number';
+  }
+
+  return null;
 };
 
 /**

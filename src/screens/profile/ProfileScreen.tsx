@@ -20,7 +20,7 @@ import { useModal } from '../../context/ModalContext';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { ProfileStackParamList } from '../../types';
-import { conversationService } from '../../services/api';
+import { conversationService, mediaService, userService } from '../../services/api';
 
 type ProfileScreenNavigationProp = NativeStackNavigationProp<ProfileStackParamList, 'ProfileMain'>;
 
@@ -32,11 +32,12 @@ interface UserStats {
 
 const ProfileScreen = () => {
   const { theme } = useTheme();
-  const { user, logout } = useAuth();
+  const { user, logout, updateUser } = useAuth();
   const { showModal, showConfirm, showSuccess, showError } = useModal();
   const navigation = useNavigation<ProfileScreenNavigationProp>();
   const [loading, setLoading] = useState(false);
   const [statsLoading, setStatsLoading] = useState(true);
+  const [uploadingImage, setUploadingImage] = useState(false);
   const [profileImage, setProfileImage] = useState<string | null>(user?.avatar || null);
   const [showImageOptions, setShowImageOptions] = useState(false);
   const [stats, setStats] = useState<UserStats>({ totalChats: 0, totalGroups: 0, totalMessages: 0 });
@@ -53,12 +54,13 @@ const ProfileScreen = () => {
       const response = await conversationService.getConversations();
 
       if (response.success && response.data) {
-        const conversations = response.data;
-        const totalChats = conversations.filter(c => !c.isGroup).length;
-        const totalGroups = conversations.filter(c => c.isGroup).length;
+        // response.data is ConversationListResponse, which has a conversations array
+        const conversations = response.data.conversations || [];
+        const totalChats = conversations.filter(c => c.type === 'DIRECT').length;
+        const totalGroups = conversations.filter(c => c.type === 'GROUP').length;
 
-        // Count total messages from all conversations
-        const totalMessages = conversations.reduce((acc, conv) => acc + (conv.messageCount || 0), 0);
+        // Count total unread messages from all conversations
+        const totalMessages = conversations.reduce((acc, conv) => acc + (conv.unreadCount || 0), 0);
 
         setStats({
           totalChats,
@@ -110,7 +112,7 @@ const ProfileScreen = () => {
     }, 300);
   };
 
-  const handleImageResponse = (response: ImagePickerResponse) => {
+  const handleImageResponse = async (response: ImagePickerResponse) => {
     if (response.didCancel) {
       return;
     }
@@ -123,8 +125,43 @@ const ProfileScreen = () => {
     if (response.assets && response.assets.length > 0) {
       const asset = response.assets[0];
       if (asset.uri) {
+        // Show the image locally immediately for better UX
         setProfileImage(asset.uri);
-        showSuccess('Success', 'Profile photo updated!');
+        setUploadingImage(true);
+
+        try {
+          // Upload image to server
+          const uploadResult = await mediaService.uploadImage(asset.uri, 'avatar');
+
+          if (uploadResult.success && uploadResult.data?.url) {
+            // Update user profile with new avatar URL
+            const updateResult = await userService.updateProfile({
+              avatar: uploadResult.data.url,
+            });
+
+            if (updateResult.success) {
+              // Update local user state
+              if (updateUser) {
+                updateUser({ avatar: uploadResult.data.url });
+              }
+              showSuccess('Success', 'Profile photo updated!');
+            } else {
+              // Revert to previous image on failure
+              setProfileImage(user?.avatar || null);
+              showError('Error', updateResult.message || 'Failed to update profile');
+            }
+          } else {
+            // Revert to previous image on upload failure
+            setProfileImage(user?.avatar || null);
+            showError('Error', uploadResult.message || 'Failed to upload image');
+          }
+        } catch (error: any) {
+          // Revert to previous image on error
+          setProfileImage(user?.avatar || null);
+          showError('Error', error.message || 'Failed to update profile photo');
+        } finally {
+          setUploadingImage(false);
+        }
       }
     }
   };
@@ -263,11 +300,17 @@ const ProfileScreen = () => {
                 ) : (
                   <Icon name="person" size={50} color={theme.primary} />
                 )}
+                {uploadingImage && (
+                  <View style={styles.uploadingOverlay}>
+                    <ActivityIndicator size="large" color="#FFFFFF" />
+                  </View>
+                )}
               </View>
               <TouchableOpacity
                 style={[styles.editAvatarButton, { backgroundColor: theme.primary }]}
                 activeOpacity={0.7}
                 onPress={handleImagePicker}
+                disabled={uploadingImage}
               >
                 <Icon name="camera" size={16} color="#FFFFFF" />
               </TouchableOpacity>
@@ -309,7 +352,7 @@ const ProfileScreen = () => {
                   <View style={styles.statItem}>
                     <Text style={[styles.statNumber, { color: theme.text }]}>{stats.totalMessages}</Text>
                     <Text style={[styles.statLabel, { color: theme.textSecondary }]}>
-                      Messages
+                      Unread
                     </Text>
                   </View>
                 </>
@@ -489,6 +532,13 @@ const styles = StyleSheet.create({
     width: '100%',
     height: '100%',
     resizeMode: 'cover',
+  },
+  uploadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 50,
   },
   editAvatarButton: {
     position: 'absolute',

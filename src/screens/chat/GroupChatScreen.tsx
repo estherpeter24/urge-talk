@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -21,16 +21,17 @@ import {
 } from 'react-native';
 import Icon from 'react-native-vector-icons/Ionicons';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { useFocusEffect } from '@react-navigation/native';
 import { launchCamera, launchImageLibrary } from 'react-native-image-picker';
 import DocumentPicker from 'react-native-document-picker';
 import Geolocation from '@react-native-community/geolocation';
 import Contacts from 'react-native-contacts';
 import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
-import { ChatStackParamList, Message, Conversation } from '../../types';
+import { useSocket } from '../../context/SocketContext';
+import { ChatStackParamList, Message, Conversation, SocketEvent, MessageType, MessageStatus } from '../../types';
 import { Theme } from '../../constants/theme';
-import { mockGroupChats, mockGroupMessages, getUserById, getAllChats } from '../../data/mockData';
-import { messageService } from '../../services/api';
+import { messageService, conversationService, groupService, mediaService } from '../../services/api';
 import AttachmentModal from '../../components/chat/AttachmentModal';
 import DocumentMenuModal from '../../components/chat/DocumentMenuModal';
 import LocationModal from '../../components/chat/LocationModal';
@@ -51,6 +52,7 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
   const { groupId } = route.params;
   const { user } = useAuth();
   const { theme } = useTheme();
+  const socket = useSocket();
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
@@ -58,6 +60,7 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
   const [groupDescription, setGroupDescription] = useState('');
   const [participants, setParticipants] = useState<GroupParticipant[]>([]);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [groupThemeColor, setGroupThemeColor] = useState<string | null>(null);
 
   // Message actions states
   const [selectedMessage, setSelectedMessage] = useState<Message | null>(null);
@@ -103,90 +106,213 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
   const flatListRef = useRef<FlatList>(null);
 
   useEffect(() => {
-    // Load group data
-    const group = mockGroupChats.find(g => g.id === groupId);
-    if (group) {
-      setGroupName(group.name);
-      setGroupDescription(group.description || 'No description');
-
-      // Mock participants
-      setParticipants([
-        { id: 'current', name: user?.displayName || 'You', isAdmin: true },
-        { id: 'user2', name: 'John Doe', isAdmin: false },
-        { id: 'user3', name: 'Jane Smith', isAdmin: false },
-        { id: 'user4', name: 'Bob Johnson', isAdmin: true },
-      ]);
-
-      setIsAdmin(true); // Current user is admin
-    }
+    // Load group data from API
+    loadGroupData();
 
     // Load messages
     loadMessages();
 
     // Load available chats for forwarding
     loadAvailableChats();
+
+    // Mark conversation as read to clear unread badge
+    markConversationAsRead();
   }, [groupId]);
 
-  const loadMessages = async () => {
-    const groupMessages = mockGroupMessages[groupId] || [];
+  // Reload group data when screen comes back into focus (e.g., after changing theme in GroupInfo)
+  useFocusEffect(
+    useCallback(() => {
+      loadGroupData();
+    }, [groupId])
+  );
 
-    const formattedMessages: Message[] = groupMessages.map((msg) => {
-      const sender = getUserById(msg.senderId);
-      return {
-        id: msg.id,
-        conversationId: groupId,
-        senderId: msg.senderId,
-        senderName: sender?.name || 'Unknown',
-        content: msg.text,
-        type: 'TEXT',
-        status: msg.status.toUpperCase() as any,
-        isEncrypted: true,
-        createdAt: new Date(msg.timestamp),
-        updatedAt: new Date(msg.timestamp),
-      };
-    });
-
-    setMessages(formattedMessages);
+  // Mark conversation as read on the backend
+  const markConversationAsRead = async () => {
+    try {
+      await conversationService.markAsRead(groupId);
+    } catch (error) {
+      console.error('Mark as read error:', error);
+    }
   };
 
-  const loadAvailableChats = () => {
-    const mockChats = getAllChats();
+  // Real-time socket integration
+  useEffect(() => {
+    if (!socket) return;
 
-    // Convert mock chats to Conversation format
-    const formattedConversations: Conversation[] = mockChats
-      .filter(chat => chat.id !== groupId) // Exclude current group
-      .map((chat) => {
-        if (chat.type === 'group') {
-          return {
-            id: chat.id,
-            name: chat.name,
-            avatar: undefined,
-            lastMessage: {
-              content: chat.lastMessage.text,
-              createdAt: chat.lastMessage.timestamp,
-            },
-            unreadCount: chat.unreadCount,
-            isTyping: false,
-          };
-        } else {
-          const otherUserId = chat.participants.find(id => id !== 'current');
-          const otherUser = otherUserId ? getUserById(otherUserId) : undefined;
+    // Join the conversation room
+    socket.joinConversation(groupId);
 
-          return {
-            id: chat.id,
-            name: otherUser?.name || 'Unknown',
-            avatar: otherUser?.avatar,
-            lastMessage: {
-              content: chat.lastMessage.text,
-              createdAt: chat.lastMessage.timestamp,
-            },
-            unreadCount: chat.unreadCount,
-            isTyping: false,
-          };
+    // Handle new message received
+    const handleMessageReceived = (message: Message) => {
+      if (message.conversationId === groupId) {
+        // Skip messages from the current user - they're already added optimistically
+        if (message.senderId === user?.id) {
+          return;
         }
-      });
+        setMessages(prev => {
+          // Also check if message already exists (by ID) to prevent duplicates
+          if (prev.some(m => m.id === message.id)) {
+            return prev;
+          }
+          return [...prev, message];
+        });
+        // Mark as read if we're viewing the conversation
+        socket.markMessageRead(message.id, groupId);
+        // Scroll to bottom
+        setTimeout(() => {
+          flatListRef.current?.scrollToEnd({ animated: true });
+        }, 100);
+      }
+    };
 
-    setAvailableChats(formattedConversations);
+    // Handle message delivered status
+    const handleMessageDelivered = (messageId: string) => {
+      setMessages(prev => prev.map(msg =>
+        msg.id === messageId ? { ...msg, status: MessageStatus.DELIVERED } : msg
+      ));
+    };
+
+    // Handle message read status
+    const handleMessageRead = (data: { messageId: string; userId: string }) => {
+      setMessages(prev => prev.map(msg =>
+        msg.id === data.messageId ? { ...msg, status: MessageStatus.READ } : msg
+      ));
+    };
+
+    // Register event listeners
+    socket.addEventListener(SocketEvent.MESSAGE_RECEIVED, handleMessageReceived);
+    socket.addEventListener(SocketEvent.MESSAGE_DELIVERED, handleMessageDelivered);
+    socket.addEventListener(SocketEvent.MESSAGE_READ, handleMessageRead);
+
+    // Cleanup on unmount - don't leave conversation room, backend auto-manages rooms
+    return () => {
+      // Note: We don't call leaveConversation here anymore.
+      // Backend auto-joins users to all their conversation rooms on connect.
+      socket.removeEventListener(SocketEvent.MESSAGE_RECEIVED, handleMessageReceived);
+      socket.removeEventListener(SocketEvent.MESSAGE_DELIVERED, handleMessageDelivered);
+      socket.removeEventListener(SocketEvent.MESSAGE_READ, handleMessageRead);
+    };
+  }, [groupId, socket, user?.id]);
+
+  const loadGroupData = async () => {
+    try {
+      const response = await groupService.getGroupByConversation(groupId);
+
+      if (response.success && response.data) {
+        const groupData = response.data;
+        setGroupName(groupData.name || 'Unnamed Group');
+        setGroupDescription(groupData.description || 'No description');
+
+        // Convert members to participants with new role system
+        const groupParticipants: GroupParticipant[] = groupData.members.map((member: any) => ({
+          id: member.user_id || member.userId,
+          name: member.display_name || member.displayName || 'Unknown',
+          isAdmin: member.role === 'FOUNDER' ||
+                   member.role === 'ACCOUNTANT' ||
+                   member.role === 'MODERATOR' ||
+                   member.role === 'RECRUITER' ||
+                   member.role === 'SUPPORT' ||
+                   member.role === 'CHEERLEADER',
+        }));
+
+        setParticipants(groupParticipants);
+
+        // Check if current user is admin (founder or any co-founder role)
+        const currentUserMember = groupData.members.find(
+          (m: any) => (m.user_id || m.userId) === user?.id
+        );
+        const userRole = currentUserMember?.role;
+        setIsAdmin(
+          userRole === 'FOUNDER' ||
+          userRole === 'ACCOUNTANT' ||
+          userRole === 'MODERATOR' ||
+          userRole === 'RECRUITER' ||
+          userRole === 'SUPPORT' ||
+          userRole === 'CHEERLEADER'
+        );
+
+        // Load theme color from group settings
+        if (groupData.settings?.theme_color) {
+          setGroupThemeColor(groupData.settings.theme_color);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load group data:', error);
+      Alert.alert('Error', 'Failed to load group data');
+    }
+  };
+
+  const loadMessages = async () => {
+    try {
+      const response = await conversationService.getMessages(groupId, 50);
+
+      if (response.success && response.data) {
+        const responseData = response.data as any;
+        const apiMessages = responseData.messages || responseData;
+        const formattedMessages: Message[] = apiMessages.map((msg: any) => {
+          const msgData = msg as any;
+          return {
+            id: msgData.id,
+            conversationId: groupId,
+            senderId: msgData.senderId || msgData.sender_id,
+            senderName: msgData.senderName || msgData.sender_name || 'Unknown',
+            content: msgData.content,
+            type: (msgData.messageType || msgData.message_type || msgData.type || MessageType.TEXT) as MessageType,
+            status: (msgData.status?.toUpperCase() || MessageStatus.SENT) as MessageStatus,
+            mediaUrl: msgData.mediaUrl || msgData.media_url,
+            thumbnailUrl: msgData.thumbnailUrl || msgData.thumbnail_url,
+            isEncrypted: msgData.isEncrypted || msgData.is_encrypted || true,
+            isForwarded: msgData.isForwarded || msgData.is_forwarded || false,
+            createdAt: new Date(msgData.createdAt || msgData.created_at),
+            updatedAt: new Date(msgData.updatedAt || msgData.updated_at || msgData.createdAt || msgData.created_at),
+          };
+        });
+
+        setMessages(formattedMessages);
+      }
+    } catch (error) {
+      console.error('Failed to load messages:', error);
+      Alert.alert('Error', 'Failed to load messages');
+    }
+  };
+
+  const loadAvailableChats = async () => {
+    try {
+      const response = await conversationService.getConversations(50, 0);
+      if (response.success && response.data) {
+        const formattedConversations: Conversation[] = response.data.conversations
+          .filter((conv: any) => conv.id !== groupId)
+          .map((conv: any) => {
+            const data = conv as any;
+            let lastMessage: Message | undefined;
+            if (data.last_message) {
+              lastMessage = {
+                id: data.last_message.id || '',
+                conversationId: data.id,
+                senderId: data.last_message.sender_id || '',
+                senderName: data.last_message.sender_name || 'Unknown',
+                content: data.last_message.content || '',
+                type: (data.last_message.message_type || MessageType.TEXT) as MessageType,
+                status: (data.last_message.status || MessageStatus.SENT) as MessageStatus,
+                isEncrypted: data.last_message.is_encrypted || false,
+                createdAt: new Date(data.last_message.created_at || new Date()),
+                updatedAt: new Date(data.last_message.updated_at || data.last_message.created_at || new Date()),
+              };
+            }
+            return {
+              id: data.id,
+              name: data.name || 'Unknown',
+              avatar: data.avatar_url,
+              lastMessage,
+              unreadCount: data.unread_count || 0,
+              isTyping: false,
+            };
+          });
+        setAvailableChats(formattedConversations);
+      }
+    } catch (error) {
+      console.error('Load chats error:', error);
+    }
   };
 
   const loadDeviceContacts = async () => {
@@ -230,34 +356,74 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
     }
   };
 
-  const handleSend = () => {
+  const handleSend = async () => {
     if (!inputText.trim()) return;
 
-    const newMessage: Message = {
-      id: `msg-new-${Date.now()}`,
+    const tempId = `temp-${Date.now()}`;
+    const optimisticMessage: Message = {
+      id: tempId,
       conversationId: groupId,
-      senderId: 'current',
+      senderId: user?.id || 'current',
       senderName: user?.displayName || 'You',
       content: inputText.trim(),
-      type: 'TEXT',
-      status: 'SENT',
+      type: MessageType.TEXT,
+      status: MessageStatus.SENDING,
       isEncrypted: true,
       createdAt: new Date(),
       updatedAt: new Date(),
       replyTo: replyingTo ? {
         id: replyingTo.id,
-        senderName: replyingTo.senderName,
+        senderName: replyingTo.senderName || 'Unknown',
         content: replyingTo.content || 'Media',
       } : undefined,
     };
 
-    setMessages(prev => [...prev, newMessage]);
+    // Add optimistic message immediately
+    setMessages(prev => [...prev, optimisticMessage]);
+    const messageContent = inputText.trim();
+    const replyToId = replyingTo?.id; // Save before clearing
     setInputText('');
     setReplyingTo(null);
 
+    // Scroll to bottom
     setTimeout(() => {
       flatListRef.current?.scrollToEnd({ animated: true });
     }, 100);
+
+    try {
+      const response = await messageService.sendMessage({
+        conversation_id: groupId,
+        content: messageContent,
+        message_type: MessageType.TEXT,
+        reply_to_id: replyToId,
+      });
+
+      if (response.success && response.data) {
+        const data = response.data as any;
+        // Replace optimistic message with real message
+        setMessages(prev => prev.map(msg =>
+          msg.id === tempId ? {
+            ...msg,
+            id: data.id,
+            status: MessageStatus.SENT,
+            createdAt: new Date(data.created_at || data.createdAt),
+            updatedAt: new Date(data.updated_at || data.updatedAt),
+          } : msg
+        ));
+      } else {
+        // Mark message as failed
+        setMessages(prev => prev.map(msg =>
+          msg.id === tempId ? { ...msg, status: MessageStatus.FAILED } : msg
+        ));
+        Alert.alert('Error', response.message || 'Failed to send message');
+      }
+    } catch (error) {
+      console.error('Send message error:', error);
+      setMessages(prev => prev.map(msg =>
+        msg.id === tempId ? { ...msg, status: MessageStatus.FAILED } : msg
+      ));
+      Alert.alert('Error', 'Failed to send message');
+    }
   };
 
   // Message action handlers
@@ -298,18 +464,35 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
     }
   };
 
-  const handleStar = () => {
+  const handleStar = async () => {
     if (selectedMessage) {
       setShowMessageActions(false);
       const newStarred = new Set(starredMessages);
-      if (newStarred.has(selectedMessage.id)) {
-        newStarred.delete(selectedMessage.id);
-        showToastNotification('Message unstarred');
-      } else {
-        newStarred.add(selectedMessage.id);
-        showToastNotification('Message starred');
+      const isStarred = newStarred.has(selectedMessage.id);
+
+      try {
+        // Use starMessage or unstarMessage based on current state
+        const response = isStarred
+          ? await messageService.unstarMessage(selectedMessage.id)
+          : await messageService.starMessage(selectedMessage.id);
+
+        if (response.success) {
+          if (isStarred) {
+            newStarred.delete(selectedMessage.id);
+            showToastNotification('Message unstarred');
+          } else {
+            newStarred.add(selectedMessage.id);
+            showToastNotification('Message starred');
+          }
+          setStarredMessages(newStarred);
+        } else {
+          Alert.alert('Error', response.message || 'Failed to star message');
+        }
+      } catch (error) {
+        console.error('Star error:', error);
+        Alert.alert('Error', 'Failed to star message');
       }
-      setStarredMessages(newStarred);
+
       setSelectedMessage(null);
     }
   };
@@ -338,11 +521,29 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
     });
   };
 
-  const confirmForward = () => {
-    if (selectedForwardChats.length > 0) {
-      // Here you would actually forward the message to the selected chats
-      // When backend is ready, make API calls to forward the message
-      showToastNotification(`Message forwarded to ${selectedForwardChats.length} chat${selectedForwardChats.length > 1 ? 's' : ''}`);
+  const confirmForward = async () => {
+    if (selectedForwardChats.length > 0 && selectedMessage) {
+      try {
+        // Forward to each selected conversation
+        let successCount = 0;
+        for (const targetConvId of selectedForwardChats) {
+          const response = await messageService.forwardMessages({
+            message_ids: [selectedMessage.id],
+            conversation_id: targetConvId,
+          });
+          if (response.success) successCount++;
+        }
+
+        if (successCount > 0) {
+          showToastNotification(`Message forwarded to ${successCount} chat${successCount > 1 ? 's' : ''}`);
+        } else {
+          Alert.alert('Error', 'Failed to forward message');
+        }
+      } catch (error) {
+        console.error('Forward error:', error);
+        Alert.alert('Error', 'Failed to forward message');
+      }
+
       setShowForwardModal(false);
       setSelectedForwardChats([]);
       setForwardSearchQuery('');
@@ -363,20 +564,40 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
     setTimeout(() => setShowToast(false), 2000);
   };
 
-  const deleteForMe = () => {
+  const deleteForMe = async () => {
     if (messageToDelete) {
-      setMessages(prev => prev.filter(m => m.id !== messageToDelete.id));
-      showToastNotification('Message deleted');
+      try {
+        const response = await messageService.deleteMessage(messageToDelete.id);
+        if (response.success) {
+          setMessages(prev => prev.filter(m => m.id !== messageToDelete.id));
+          showToastNotification('Message deleted');
+        } else {
+          Alert.alert('Error', response.message || 'Failed to delete message');
+        }
+      } catch (error) {
+        console.error('Delete error:', error);
+        Alert.alert('Error', 'Failed to delete message');
+      }
       setShowDeleteModal(false);
       setMessageToDelete(null);
       setSelectedMessage(null);
     }
   };
 
-  const deleteForEveryone = () => {
+  const deleteForEveryone = async () => {
     if (messageToDelete) {
-      setMessages(prev => prev.filter(m => m.id !== messageToDelete.id));
-      showToastNotification('Message deleted for everyone');
+      try {
+        const response = await messageService.deleteMessage(messageToDelete.id);
+        if (response.success) {
+          setMessages(prev => prev.filter(m => m.id !== messageToDelete.id));
+          showToastNotification('Message deleted for everyone');
+        } else {
+          Alert.alert('Error', response.message || 'Failed to delete message');
+        }
+      } catch (error) {
+        console.error('Delete error:', error);
+        Alert.alert('Error', 'Failed to delete message');
+      }
       setShowDeleteModal(false);
       setMessageToDelete(null);
       setSelectedMessage(null);
@@ -394,7 +615,8 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
   };
 
   const handleGroupInfo = () => {
-    setShowGroupInfo(true);
+    // Navigate to the new GroupInfoScreen
+    navigation.navigate('GroupInfo', { groupId });
   };
 
   const handleExitGroup = () => {
@@ -403,10 +625,22 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
     console.log('showExitGroupModal set to true');
   };
 
-  const confirmExitGroup = () => {
-    setShowExitGroupModal(false);
-    showToastNotification('You left the group');
-    navigation.goBack();
+  const confirmExitGroup = async () => {
+    try {
+      const response = await groupService.leaveGroup(groupId);
+      if (response.success) {
+        setShowExitGroupModal(false);
+        showToastNotification('You left the group');
+        navigation.goBack();
+      } else {
+        Alert.alert('Error', response.message || 'Failed to leave group');
+        setShowExitGroupModal(false);
+      }
+    } catch (error) {
+      console.error('Leave group error:', error);
+      Alert.alert('Error', 'Failed to leave group');
+      setShowExitGroupModal(false);
+    }
   };
 
   const cancelExitGroup = () => {
@@ -444,7 +678,7 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
     }, 300);
   };
 
-  const sendMediaMessage = async (mediaUrl: string, type: 'IMAGE' | 'VIDEO' | 'AUDIO' | 'DOCUMENT', content?: string) => {
+  const sendMediaMessage = async (mediaUrl: string, type: MessageType.IMAGE | MessageType.VIDEO | MessageType.AUDIO | MessageType.DOCUMENT, content?: string) => {
     try {
       const response = await messageService.sendMessage({
         conversation_id: groupId,
@@ -456,18 +690,19 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
       console.log(`📸 ${type} message response (group):`, JSON.stringify(response, null, 2));
 
       if (response.success && response.data) {
+        const data = response.data as any;
         const newMessage: Message = {
-          id: response.data.id,
-          conversationId: response.data.conversationId || response.data.conversation_id,
-          senderId: response.data.senderId || response.data.sender_id,
-          senderName: response.data.senderName || response.data.sender_name || 'You',
-          content: response.data.content || '',
-          type: response.data.messageType || response.data.message_type,
-          status: response.data.status,
-          isEncrypted: response.data.isEncrypted || response.data.is_encrypted || false,
-          mediaUrl: response.data.mediaUrl || response.data.media_url,
-          createdAt: new Date(response.data.createdAt || response.data.created_at),
-          updatedAt: new Date(response.data.updatedAt || response.data.updated_at),
+          id: data.id,
+          conversationId: data.conversationId || data.conversation_id,
+          senderId: data.senderId || data.sender_id,
+          senderName: data.senderName || data.sender_name || 'You',
+          content: data.content || '',
+          type: (data.messageType || data.message_type) as MessageType,
+          status: data.status as MessageStatus,
+          isEncrypted: data.isEncrypted || data.is_encrypted || false,
+          mediaUrl: data.mediaUrl || data.media_url,
+          createdAt: new Date(data.createdAt || data.created_at),
+          updatedAt: new Date(data.updatedAt || data.updated_at),
         };
         console.log(`📸 Created ${type} message (group):`, JSON.stringify(newMessage, null, 2));
         setMessages(prev => [...prev, newMessage]);
@@ -491,8 +726,81 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
       if (result.assets && result.assets[0]) {
         const asset = result.assets[0];
         const isVideo = asset.type?.includes('video');
-        if (asset.uri) {
-          await sendMediaMessage(asset.uri, isVideo ? 'VIDEO' : 'IMAGE');
+        const tempId = `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+        // Create optimistic message with local URI
+        const optimisticMessage: Message = {
+          id: tempId,
+          conversationId: groupId,
+          senderId: user?.id || '',
+          senderName: user?.displayName || 'You',
+          content: '',
+          type: isVideo ? MessageType.VIDEO : MessageType.IMAGE,
+          status: MessageStatus.SENDING,
+          isEncrypted: false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          localUri: asset.uri,
+          isUploading: true,
+          uploadProgress: 0,
+        };
+
+        // Add optimistic message immediately
+        setMessages(prev => [...prev, optimisticMessage]);
+        setTimeout(() => {
+          flatListRef.current?.scrollToEnd({ animated: true });
+        }, 100);
+
+        // Upload media first
+        try {
+          const uploadResponse = await mediaService.uploadMedia({
+            uri: asset.uri,
+            type: asset.type || 'image/jpeg',
+            name: asset.fileName || 'capture.jpg',
+          }, (progress) => {
+            setMessages(prev => prev.map(msg =>
+              msg.id === tempId ? { ...msg, uploadProgress: progress } : msg
+            ));
+          });
+
+          if (uploadResponse.file_url) {
+            // Send message with uploaded URL
+            const msgResponse = await messageService.sendMessage({
+              conversation_id: groupId,
+              content: '',
+              message_type: isVideo ? MessageType.VIDEO : MessageType.IMAGE,
+              media_url: uploadResponse.file_url,
+            });
+
+            if (msgResponse.success && msgResponse.data) {
+              const data = msgResponse.data as any;
+              setMessages(prev => prev.map(msg =>
+                msg.id === tempId ? {
+                  id: data.id,
+                  conversationId: data.conversationId || data.conversation_id,
+                  senderId: data.senderId || data.sender_id,
+                  senderName: data.senderName || data.sender_name || 'You',
+                  content: data.content || '',
+                  type: (data.messageType || data.message_type || (isVideo ? MessageType.VIDEO : MessageType.IMAGE)) as MessageType,
+                  status: (data.status || MessageStatus.SENT) as MessageStatus,
+                  isEncrypted: data.isEncrypted || data.is_encrypted || false,
+                  mediaUrl: data.mediaUrl || data.media_url,
+                  createdAt: new Date(data.createdAt || data.created_at),
+                  updatedAt: new Date(data.updatedAt || data.updated_at),
+                  isUploading: false,
+                } : msg
+              ));
+            }
+          } else {
+            setMessages(prev => prev.map(msg =>
+              msg.id === tempId ? { ...msg, status: MessageStatus.FAILED, isUploading: false } : msg
+            ));
+          }
+        } catch (uploadError) {
+          console.error('Upload error:', uploadError);
+          setMessages(prev => prev.map(msg =>
+            msg.id === tempId ? { ...msg, status: MessageStatus.FAILED, isUploading: false } : msg
+          ));
         }
       }
     } catch (error) {
@@ -512,7 +820,80 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
         for (const asset of result.assets) {
           if (asset.uri) {
             const isVideo = asset.type?.includes('video');
-            await sendMediaMessage(asset.uri, isVideo ? 'VIDEO' : 'IMAGE');
+            const tempId = `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+            // Create optimistic message with local URI
+            const optimisticMessage: Message = {
+              id: tempId,
+              conversationId: groupId,
+              senderId: user?.id || '',
+              senderName: user?.displayName || 'You',
+              content: '',
+              type: isVideo ? MessageType.VIDEO : MessageType.IMAGE,
+              status: MessageStatus.SENDING,
+              isEncrypted: false,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+              localUri: asset.uri,
+              isUploading: true,
+              uploadProgress: 0,
+            };
+
+            setMessages(prev => [...prev, optimisticMessage]);
+            setTimeout(() => {
+              flatListRef.current?.scrollToEnd({ animated: true });
+            }, 100);
+
+            // Upload media first
+            try {
+              const uploadResponse = await mediaService.uploadMedia({
+                uri: asset.uri,
+                type: asset.type || 'image/jpeg',
+                name: asset.fileName || 'image.jpg',
+              }, (progress) => {
+                setMessages(prev => prev.map(msg =>
+                  msg.id === tempId ? { ...msg, uploadProgress: progress } : msg
+                ));
+              });
+
+              if (uploadResponse.file_url) {
+                const msgResponse = await messageService.sendMessage({
+                  conversation_id: groupId,
+                  content: '',
+                  message_type: isVideo ? MessageType.VIDEO : MessageType.IMAGE,
+                  media_url: uploadResponse.file_url,
+                });
+
+                if (msgResponse.success && msgResponse.data) {
+                  const data = msgResponse.data as any;
+                  setMessages(prev => prev.map(msg =>
+                    msg.id === tempId ? {
+                      id: data.id,
+                      conversationId: data.conversationId || data.conversation_id,
+                      senderId: data.senderId || data.sender_id,
+                      senderName: data.senderName || data.sender_name || 'You',
+                      content: data.content || '',
+                      type: (data.messageType || data.message_type || (isVideo ? MessageType.VIDEO : MessageType.IMAGE)) as MessageType,
+                      status: (data.status || MessageStatus.SENT) as MessageStatus,
+                      isEncrypted: data.isEncrypted || data.is_encrypted || false,
+                      mediaUrl: data.mediaUrl || data.media_url,
+                      createdAt: new Date(data.createdAt || data.created_at),
+                      updatedAt: new Date(data.updatedAt || data.updated_at),
+                      isUploading: false,
+                    } : msg
+                  ));
+                }
+              } else {
+                setMessages(prev => prev.map(msg =>
+                  msg.id === tempId ? { ...msg, status: MessageStatus.FAILED, isUploading: false } : msg
+                ));
+              }
+            } catch (uploadError) {
+              console.error('Upload error:', uploadError);
+              setMessages(prev => prev.map(msg =>
+                msg.id === tempId ? { ...msg, status: MessageStatus.FAILED, isUploading: false } : msg
+              ));
+            }
           }
         }
       }
@@ -542,28 +923,85 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
             const sizeInKB = doc.size ? Math.round(doc.size / 1024) : 0;
             const sizeInMB = doc.size ? (doc.size / 1024 / 1024).toFixed(1) : '0.0';
             const displaySize = sizeInKB < 1024 ? `${sizeInKB} KB` : `${sizeInMB} MB`;
+            const tempId = `temp_doc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-            const newMessage: Message = {
-              id: `msg-doc-${Date.now()}`,
+            const documentContent = {
+              name: doc.name,
+              size: displaySize,
+              type: doc.type || 'application/octet-stream',
+            };
+
+            // Create optimistic message
+            const optimisticMessage: Message = {
+              id: tempId,
               conversationId: groupId,
-              senderId: 'current',
+              senderId: user?.id || '',
               senderName: user?.displayName || 'You',
-              content: JSON.stringify({
-                name: doc.name,
-                size: displaySize,
-                type: doc.type || 'application/octet-stream',
-              }),
-              type: 'DOCUMENT',
-              status: 'SENT',
+              content: JSON.stringify(documentContent),
+              type: MessageType.DOCUMENT,
+              status: MessageStatus.SENDING,
               isEncrypted: true,
-              mediaUrl: doc.uri,
+              localUri: doc.uri,
+              isUploading: true,
+              uploadProgress: 0,
               createdAt: new Date(),
               updatedAt: new Date(),
             };
-            setMessages(prev => [...prev, newMessage]);
+            setMessages(prev => [...prev, optimisticMessage]);
             setTimeout(() => {
               flatListRef.current?.scrollToEnd({ animated: true });
             }, 100);
+
+            // Upload document and send message
+            try {
+              const uploadResponse = await mediaService.uploadMedia({
+                uri: doc.uri || '',
+                type: doc.type || 'application/octet-stream',
+                name: doc.name || 'document',
+              }, (progress) => {
+                setMessages(prev => prev.map(msg =>
+                  msg.id === tempId ? { ...msg, uploadProgress: progress } : msg
+                ));
+              });
+
+              if (uploadResponse.file_url) {
+                const msgResponse = await messageService.sendMessage({
+                  conversation_id: groupId,
+                  content: JSON.stringify(documentContent),
+                  message_type: MessageType.DOCUMENT,
+                  media_url: uploadResponse.file_url,
+                });
+
+                if (msgResponse.success && msgResponse.data) {
+                  const data = msgResponse.data as any;
+                  setMessages(prev => prev.map(msg =>
+                    msg.id === tempId ? {
+                      id: data.id,
+                      conversationId: data.conversationId || data.conversation_id,
+                      senderId: data.senderId || data.sender_id,
+                      senderName: data.senderName || data.sender_name || 'You',
+                      content: data.content || JSON.stringify(documentContent),
+                      type: MessageType.DOCUMENT,
+                      status: MessageStatus.SENT,
+                      isEncrypted: data.isEncrypted || data.is_encrypted || false,
+                      mediaUrl: data.mediaUrl || data.media_url,
+                      createdAt: new Date(data.createdAt || data.created_at),
+                      updatedAt: new Date(data.updatedAt || data.updated_at),
+                      isUploading: false,
+                    } : msg
+                  ));
+                }
+              } else {
+                setMessages(prev => prev.map(msg =>
+                  msg.id === tempId ? { ...msg, status: MessageStatus.FAILED, isUploading: false } : msg
+                ));
+              }
+            } catch (uploadError) {
+              console.error('Document upload error:', uploadError);
+              setMessages(prev => prev.map(msg =>
+                msg.id === tempId ? { ...msg, status: MessageStatus.FAILED, isUploading: false } : msg
+              ));
+            }
           }
         } else if (type === 'gallery') {
           handleGalleryPicker();
@@ -606,35 +1044,75 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
     }, 300);
   };
 
-  const sendLocation = (isLive: boolean) => {
-    if (!currentLocation) return;
+  const sendLocation = async (isLive: boolean, customLocation?: { latitude: number; longitude: number }, durationMinutes?: number) => {
+    const locationToSend = customLocation || currentLocation;
+    if (!locationToSend) return;
 
-    const locationData = {
-      latitude: currentLocation.latitude,
-      longitude: currentLocation.longitude,
+    const locationData: any = {
+      latitude: locationToSend.latitude,
+      longitude: locationToSend.longitude,
       isLive,
     };
 
-    const newMessage: Message = {
-      id: `msg-loc-${Date.now()}`,
+    // Add duration for live location
+    if (isLive && durationMinutes) {
+      locationData.durationMinutes = durationMinutes;
+      locationData.expiresAt = new Date(Date.now() + durationMinutes * 60 * 1000).toISOString();
+    }
+
+    const tempId = `msg-loc-${Date.now()}`;
+    const optimisticMessage: Message = {
+      id: tempId,
       conversationId: groupId,
-      senderId: 'current',
+      senderId: user?.id || 'current',
       senderName: user?.displayName || 'You',
       content: JSON.stringify(locationData),
-      type: 'LOCATION',
-      status: 'SENT',
+      type: MessageType.LOCATION,
+      status: MessageStatus.SENDING,
       isEncrypted: true,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
 
-    setMessages(prev => [...prev, newMessage]);
+    // Add optimistic message
+    setMessages(prev => [...prev, optimisticMessage]);
     setShowLocationModal(false);
     setCurrentLocation(null);
 
     setTimeout(() => {
       flatListRef.current?.scrollToEnd({ animated: true });
     }, 100);
+
+    // Send to API
+    try {
+      const response = await messageService.sendMessage({
+        conversation_id: groupId,
+        content: JSON.stringify(locationData),
+        message_type: MessageType.LOCATION,
+      });
+
+      if (response.success && response.data) {
+        const data = response.data as any;
+        // Update the optimistic message with the real one
+        setMessages(prev => prev.map(msg =>
+          msg.id === tempId ? {
+            ...msg,
+            id: data.id,
+            status: MessageStatus.SENT,
+          } : msg
+        ));
+      } else {
+        // Mark as failed
+        setMessages(prev => prev.map(msg =>
+          msg.id === tempId ? { ...msg, status: MessageStatus.FAILED } : msg
+        ));
+      }
+    } catch (error) {
+      console.error('Failed to send location:', error);
+      setMessages(prev => prev.map(msg =>
+        msg.id === tempId ? { ...msg, status: MessageStatus.FAILED } : msg
+      ));
+    }
   };
 
   const openInGoogleMaps = (latitude: number, longitude: number) => {
@@ -684,23 +1162,24 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
             name: contact.name,
             phone: contact.phone,
           }),
-          message_type: 'CONTACT',
+          message_type: MessageType.CONTACT,
         });
 
         console.log('📧 Contact message response (group):', JSON.stringify(response, null, 2));
 
         if (response.success && response.data) {
+          const data = response.data as any;
           const newMessage: Message = {
-            id: response.data.id,
-            conversationId: response.data.conversationId || response.data.conversation_id,
-            senderId: response.data.senderId || response.data.sender_id,
-            senderName: response.data.senderName || response.data.sender_name || 'You',
-            content: response.data.content,
-            type: 'CONTACT',
-            status: response.data.status,
-            isEncrypted: response.data.isEncrypted || response.data.is_encrypted || false,
-            createdAt: new Date(response.data.createdAt || response.data.created_at),
-            updatedAt: new Date(response.data.updatedAt || response.data.updated_at),
+            id: data.id,
+            conversationId: data.conversationId || data.conversation_id,
+            senderId: data.senderId || data.sender_id,
+            senderName: data.senderName || data.sender_name || 'You',
+            content: data.content,
+            type: MessageType.CONTACT,
+            status: data.status as MessageStatus,
+            isEncrypted: data.isEncrypted || data.is_encrypted || false,
+            createdAt: new Date(data.createdAt || data.created_at),
+            updatedAt: new Date(data.updatedAt || data.updated_at),
           };
           console.log('📧 Created contact message (group):', JSON.stringify(newMessage, null, 2));
           setMessages(prev => [...prev, newMessage]);
@@ -767,7 +1246,60 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
   };
 
   const renderMessage = ({ item }: { item: Message }) => {
-    const isMine = item.senderId === 'current' || item.senderId === user?.id;
+    const currentUserId = user?.id;
+    const isMine = item.senderId === 'current' || (currentUserId && item.senderId === currentUserId);
+    const isMediaMessage = item.type === 'IMAGE' || item.type === 'VIDEO';
+    const isDocument = item.type === 'DOCUMENT';
+
+    // System message rendering (like WhatsApp's "X left the group")
+    if (item.type === 'SYSTEM') {
+      return (
+        <View style={styles.systemMessageContainer}>
+          <View style={[styles.systemMessageBubble, { backgroundColor: theme.surfaceVariant || '#E8E8E8' }]}>
+            <Text style={[styles.systemMessageText, { color: theme.textSecondary }]}>
+              {item.content}
+            </Text>
+          </View>
+        </View>
+      );
+    }
+
+    // Parse document data
+    let documentData = null;
+    if (isDocument && item.content) {
+      if (typeof item.content === 'object') {
+        documentData = item.content;
+      } else if (typeof item.content === 'string') {
+        try {
+          documentData = JSON.parse(item.content);
+        } catch (e) {
+          // Fallback parsing
+          try {
+            const nameMatch = item.content.match(/"name":"([^"]+)"/);
+            const sizeMatch = item.content.match(/"size":"([^"]+)"/);
+            if (nameMatch && sizeMatch) {
+              documentData = { name: nameMatch[1], size: sizeMatch[1], type: 'application/octet-stream' };
+            }
+          } catch (fallbackError) {}
+        }
+      }
+    }
+
+    // Parse location data
+    let locationData = null;
+    if (item.type === 'LOCATION' && item.content) {
+      try {
+        locationData = JSON.parse(item.content);
+      } catch (e) {}
+    }
+
+    // Parse contact data
+    let contactData = null;
+    if (item.type === 'CONTACT' && item.content) {
+      try {
+        contactData = JSON.parse(item.content);
+      } catch (e) {}
+    }
 
     return (
       <TouchableOpacity
@@ -785,40 +1317,163 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
             {
               backgroundColor: isMine ? theme.messageBubble.sent : theme.messageBubble.received,
             },
+            isMediaMessage && styles.mediaBubble,
+            isDocument && styles.documentBubble,
           ]}
         >
-          {isMine && (
-            <View style={[styles.accentLine, { backgroundColor: theme.primaryLight }]} />
+          {isMine && !isMediaMessage && !isDocument && (
+            <View style={[styles.accentLine, { backgroundColor: groupThemeColor || theme.primaryLight }]} />
           )}
 
           {!isMine && (
-            <Text style={[styles.senderName, { color: theme.primary }]}>
+            <Text style={[styles.senderName, { color: groupThemeColor || theme.primary }]}>
               {item.senderName}
             </Text>
           )}
 
-          {/* Reply Preview */}
-          {item.replyTo && (
-            <View style={[styles.replyPreview, { backgroundColor: isMine ? 'rgba(0, 0, 0, 0.1)' : 'rgba(0, 0, 0, 0.05)', borderLeftColor: theme.primary }]}>
-              <Text style={[styles.replyPreviewSender, { color: theme.primary }]} numberOfLines={1}>
-                {item.replyTo.senderName}
-              </Text>
-              <Text style={[styles.replyPreviewContent, { color: isMine ? 'rgba(255, 255, 255, 0.7)' : theme.textSecondary }]} numberOfLines={1}>
-                {item.replyTo.content}
+          {/* Forwarded Tag */}
+          {item.isForwarded && (
+            <View style={styles.forwardedTag}>
+              <Icon name="arrow-redo" size={12} color={isMine ? 'rgba(255, 255, 255, 0.6)' : theme.textSecondary} />
+              <Text style={[styles.forwardedText, { color: isMine ? 'rgba(255, 255, 255, 0.6)' : theme.textSecondary }]}>
+                Forwarded
               </Text>
             </View>
           )}
 
-          <Text
-            style={[
-              styles.messageText,
-              { color: isMine ? theme.messageBubble.sentText : theme.messageBubble.receivedText },
-            ]}
-          >
-            {item.content}
-          </Text>
+          {/* Reply Preview */}
+          {item.replyTo && (
+            <View style={[styles.replyPreview, { backgroundColor: isMine ? 'rgba(0, 0, 0, 0.1)' : 'rgba(0, 0, 0, 0.05)', borderLeftColor: groupThemeColor || theme.primary }]}>
+              <Text style={[styles.replyPreviewSender, { color: groupThemeColor || theme.primary }]} numberOfLines={1}>
+                {item.replyTo.senderName || 'Unknown'}
+              </Text>
+              <Text style={[styles.replyPreviewContent, { color: isMine ? 'rgba(255, 255, 255, 0.7)' : theme.textSecondary }]} numberOfLines={1}>
+                {item.replyTo.content || 'Message'}
+              </Text>
+            </View>
+          )}
 
-          <View style={styles.timeContainer}>
+          {/* Location Message */}
+          {item.type === 'LOCATION' && locationData ? (
+            <TouchableOpacity
+              style={[styles.locationContainer, { backgroundColor: isMine ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.05)' }]}
+              onPress={() => openInGoogleMaps(locationData.latitude, locationData.longitude)}
+              activeOpacity={0.7}
+            >
+              <View style={styles.locationMapPreview}>
+                <Icon name="location" size={40} color={isMine ? theme.messageBubble.sentText : theme.primary} />
+                {locationData.isLive && (
+                  <View style={styles.liveLocationIndicator}>
+                    <View style={[styles.liveLocationDot, { backgroundColor: '#00D46E' }]} />
+                    <Text style={[styles.liveLocationText, { color: isMine ? theme.messageBubble.sentText : theme.text }]}>
+                      Live Location
+                    </Text>
+                  </View>
+                )}
+              </View>
+              <View style={styles.locationInfo}>
+                <Text style={[styles.locationTitle, { color: isMine ? theme.messageBubble.sentText : theme.messageBubble.receivedText }]}>
+                  {locationData.isLive ? 'Live Location' : 'Current Location'}
+                </Text>
+                <Text style={[styles.locationCoords, { color: isMine ? 'rgba(255, 255, 255, 0.7)' : theme.textSecondary }]}>
+                  {locationData.latitude.toFixed(6)}, {locationData.longitude.toFixed(6)}
+                </Text>
+              </View>
+            </TouchableOpacity>
+          ) : item.type === 'CONTACT' && contactData ? (
+            /* Contact Message */
+            <View style={[styles.contactMessageContainer, { backgroundColor: isMine ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.05)' }]}>
+              <View style={styles.contactMessageContent}>
+                <View style={[styles.contactMessageAvatar, { backgroundColor: theme.primary }]}>
+                  <Text style={styles.contactMessageAvatarText}>
+                    {getInitials(contactData.name)}
+                  </Text>
+                </View>
+                <View style={styles.contactMessageInfo}>
+                  <View style={styles.contactMessageHeader}>
+                    <Icon name="person" size={16} color={isMine ? theme.messageBubble.sentText : theme.text} style={{ marginRight: 4 }} />
+                    <Text style={[styles.contactMessageName, { color: isMine ? theme.messageBubble.sentText : theme.messageBubble.receivedText }]}>
+                      {contactData.name}
+                    </Text>
+                  </View>
+                  <Text style={[styles.contactMessagePhone, { color: isMine ? 'rgba(255, 255, 255, 0.7)' : theme.textSecondary }]}>
+                    {contactData.phone}
+                  </Text>
+                </View>
+              </View>
+              <TouchableOpacity
+                style={[styles.contactMessageButton, { borderTopColor: isMine ? 'rgba(255, 255, 255, 0.2)' : theme.border }]}
+                onPress={() => Linking.openURL(`tel:${contactData.phone}`)}
+              >
+                <Icon name="chatbubble" size={18} color={isMine ? theme.messageBubble.sentText : theme.primary} />
+                <Text style={[styles.contactMessageButtonText, { color: isMine ? theme.messageBubble.sentText : theme.primary }]}>
+                  Message {contactData.name.split(' ')[0]}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          ) : isDocument && documentData ? (
+            /* Document Message */
+            <View style={[styles.documentContainer, { backgroundColor: isMine ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.05)' }]}>
+              <View style={[styles.documentIconContainer, { backgroundColor: isMine ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.1)' }]}>
+                <Icon name="document-text" size={28} color={isMine ? theme.messageBubble.sentText : theme.primary} />
+              </View>
+              <View style={styles.documentInfo}>
+                <Text style={[styles.documentName, { color: isMine ? theme.messageBubble.sentText : theme.messageBubble.receivedText }]} numberOfLines={2}>
+                  {documentData.name}
+                </Text>
+                <Text style={[styles.documentSize, { color: isMine ? 'rgba(255, 255, 255, 0.7)' : theme.textSecondary }]}>
+                  {documentData.size}
+                </Text>
+              </View>
+            </View>
+          ) : item.type === 'AUDIO' ? (
+            /* Audio Message */
+            <View style={[styles.audioContainer, { backgroundColor: isMine ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.05)' }]}>
+              <TouchableOpacity style={[styles.audioPlayButton, { backgroundColor: theme.primary }]} activeOpacity={0.7}>
+                <Icon name="play" size={20} color="#FFFFFF" />
+              </TouchableOpacity>
+              <View style={styles.audioWaveform}>
+                <View style={[styles.audioProgressBar, { backgroundColor: isMine ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.1)' }]}>
+                  <View style={[styles.audioProgress, { width: '0%', backgroundColor: theme.primary }]} />
+                </View>
+              </View>
+              <Text style={[styles.audioDuration, { color: isMine ? theme.messageBubble.sentText : theme.text }]}>
+                {item.content.includes('(') ? item.content.match(/\(([^)]+)\)/)?.[1] : '0:00'}
+              </Text>
+            </View>
+          ) : isMediaMessage && (item.mediaUrl || item.localUri) ? (
+            /* Image/Video Message */
+            <View style={styles.mediaContainer}>
+              <Image source={{ uri: item.mediaUrl || item.localUri }} style={styles.mediaImage} resizeMode="cover" />
+              {item.type === 'VIDEO' && !item.isUploading && (
+                <View style={styles.videoOverlay}>
+                  <Icon name="play-circle" size={48} color="rgba(255, 255, 255, 0.9)" />
+                </View>
+              )}
+              {item.isUploading && (
+                <View style={styles.uploadOverlay}>
+                  <View style={styles.uploadProgressContainer}>
+                    <View style={[styles.uploadProgressBar, { width: `${item.uploadProgress || 0}%` }]} />
+                  </View>
+                  <Text style={styles.uploadProgressText}>
+                    {Math.round(item.uploadProgress || 0)}%
+                  </Text>
+                </View>
+              )}
+            </View>
+          ) : (
+            /* Text Message */
+            <Text
+              style={[
+                styles.messageText,
+                { color: isMine ? theme.messageBubble.sentText : theme.messageBubble.receivedText },
+              ]}
+            >
+              {item.content}
+            </Text>
+          )}
+
+          <View style={[styles.timeContainer, isMediaMessage && styles.mediaTimeContainer]}>
             {starredMessages.has(item.id) && (
               <Icon
                 name="star"
@@ -842,9 +1497,9 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
             </Text>
             {isMine && (
               <Icon
-                name="checkmark-done"
+                name={item.status === 'SENT' ? 'checkmark' : 'checkmark-done'}
                 size={16}
-                color="rgba(255, 255, 255, 0.8)"
+                color={item.status === 'READ' ? '#4FC3F7' : 'rgba(255, 255, 255, 0.8)'}
                 style={styles.checkmark}
               />
             )}
@@ -863,7 +1518,7 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.headerContent} onPress={handleGroupInfo}>
-          <View style={[styles.groupIcon, { backgroundColor: theme.primary }]}>
+          <View style={[styles.groupIcon, { backgroundColor: groupThemeColor || theme.primary }]}>
             <Icon name="people" size={20} color="#FFFFFF" />
           </View>
           <View style={styles.headerTextContainer}>
@@ -897,9 +1552,9 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
         {replyingTo && (
           <View style={[styles.replyBar, { backgroundColor: theme.surfaceElevated, borderTopColor: theme.border }]}>
             <View style={styles.replyBarContent}>
-              <View style={[styles.replyBarAccent, { backgroundColor: theme.primary }]} />
+              <View style={[styles.replyBarAccent, { backgroundColor: groupThemeColor || theme.primary }]} />
               <View style={styles.replyBarText}>
-                <Text style={[styles.replyBarSender, { color: theme.primary }]}>{replyingTo.senderName}</Text>
+                <Text style={[styles.replyBarSender, { color: groupThemeColor || theme.primary }]}>{replyingTo.senderName}</Text>
                 <Text style={[styles.replyBarMessage, { color: theme.text }]} numberOfLines={1}>
                   {replyingTo.content}
                 </Text>
@@ -921,7 +1576,7 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
           ]}
         >
           <TouchableOpacity style={styles.attachButton} onPress={handleAttachment}>
-            <Icon name="add-circle-outline" size={Theme.iconSize.md} color={theme.primary} />
+            <Icon name="add-circle-outline" size={Theme.iconSize.md} color={groupThemeColor || theme.primary} />
           </TouchableOpacity>
 
           <TextInput
@@ -935,7 +1590,7 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
           />
 
           <TouchableOpacity
-            style={[styles.sendButton, { backgroundColor: theme.primary }]}
+            style={[styles.sendButton, { backgroundColor: groupThemeColor || theme.primary }]}
             onPress={handleSend}
             disabled={!inputText.trim()}
           >
@@ -1012,7 +1667,7 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
                   <Text style={[styles.deleteModalOptionText, { color: theme.text }]}>Delete for me</Text>
                 </TouchableOpacity>
 
-                {messageToDelete && (messageToDelete.senderId === 'current' || messageToDelete.senderId === user?.id) && isAdmin && (
+                {messageToDelete && (messageToDelete.senderId === 'current' || (user?.id && messageToDelete.senderId === user.id)) && isAdmin && (
                   <TouchableOpacity
                     style={[styles.deleteModalOption, { borderBottomColor: theme.border }]}
                     onPress={deleteForEveryone}
@@ -1428,7 +2083,8 @@ const GroupChatScreen = ({ route, navigation }: Props) => {
           setCurrentLocation(null);
         }}
         onSendCurrentLocation={() => sendLocation(false)}
-        onShareLiveLocation={() => sendLocation(true)}
+        onShareLiveLocation={(duration) => sendLocation(true, undefined, duration)}
+        onSendSelectedLocation={(selectedLoc) => sendLocation(false, selectedLoc)}
       />
 
       {/* Contact Picker Modal */}
@@ -1602,6 +2258,20 @@ const styles = StyleSheet.create({
   theirMessageContainer: {
     alignItems: 'flex-start',
   },
+  systemMessageContainer: {
+    alignItems: 'center',
+    marginVertical: 8,
+    paddingHorizontal: 16,
+  },
+  systemMessageBubble: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 12,
+  },
+  systemMessageText: {
+    fontSize: 12,
+    textAlign: 'center',
+  },
   messageBubble: {
     maxWidth: '75%',
     paddingHorizontal: 14,
@@ -1652,6 +2322,16 @@ const styles = StyleSheet.create({
   },
   replyPreviewContent: {
     fontSize: 12,
+  },
+  forwardedTag: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+    gap: 4,
+  },
+  forwardedText: {
+    fontSize: 11,
+    fontStyle: 'italic',
   },
   messageText: {
     fontSize: 15,
@@ -2229,14 +2909,6 @@ const styles = StyleSheet.create({
     paddingVertical: 16,
     borderBottomWidth: 1,
   },
-  documentIconContainer: {
-    width: 45,
-    height: 45,
-    borderRadius: 22.5,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 16,
-  },
   documentMenuItemText: {
     flex: 1,
     fontSize: 16,
@@ -2403,6 +3075,213 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '600',
+  },
+  // Media message styles
+  mediaBubble: {
+    padding: 4,
+    minWidth: 200,
+  },
+  documentBubble: {
+    padding: 8,
+    minWidth: 220,
+  },
+  mediaContainer: {
+    borderRadius: 12,
+    overflow: 'hidden',
+    minWidth: 200,
+  },
+  mediaImage: {
+    width: 200,
+    height: 200,
+    borderRadius: 12,
+  },
+  videoOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.3)',
+  },
+  uploadOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  uploadProgressContainer: {
+    width: '80%',
+    height: 4,
+    backgroundColor: 'rgba(255, 255, 255, 0.3)',
+    borderRadius: 2,
+    overflow: 'hidden',
+  },
+  uploadProgressBar: {
+    height: '100%',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 2,
+  },
+  uploadProgressText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 8,
+  },
+  mediaTimeContainer: {
+    position: 'absolute',
+    bottom: 8,
+    right: 8,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    borderRadius: 8,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  // Location message styles
+  locationContainer: {
+    borderRadius: 12,
+    padding: 12,
+    minWidth: 240,
+  },
+  locationMapPreview: {
+    height: 100,
+    borderRadius: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  liveLocationIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  liveLocationDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 6,
+  },
+  liveLocationText: {
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  locationInfo: {
+    paddingTop: 4,
+  },
+  locationTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  locationCoords: {
+    fontSize: 12,
+  },
+  // Contact message styles
+  contactMessageContainer: {
+    borderRadius: 12,
+    overflow: 'hidden',
+    minWidth: 220,
+  },
+  contactMessageContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 12,
+  },
+  contactMessageAvatar: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  contactMessageAvatarText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  contactMessageInfo: {
+    flex: 1,
+  },
+  contactMessageHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  contactMessageName: {
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  contactMessagePhone: {
+    fontSize: 13,
+    marginTop: 2,
+  },
+  contactMessageButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 10,
+    borderTopWidth: 1,
+  },
+  contactMessageButtonText: {
+    fontSize: 14,
+    fontWeight: '500',
+    marginLeft: 6,
+  },
+  // Document message styles
+  documentContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 12,
+    borderRadius: 12,
+    minWidth: 200,
+  },
+  documentIconContainer: {
+    width: 48,
+    height: 48,
+    borderRadius: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  documentInfo: {
+    flex: 1,
+  },
+  documentName: {
+    fontSize: 14,
+    fontWeight: '500',
+    marginBottom: 4,
+  },
+  documentSize: {
+    fontSize: 12,
+  },
+  // Audio message styles
+  audioContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 10,
+    borderRadius: 12,
+    minWidth: 200,
+  },
+  audioPlayButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 10,
+  },
+  audioWaveform: {
+    flex: 1,
+    marginRight: 10,
+  },
+  audioProgressBar: {
+    height: 4,
+    borderRadius: 2,
+    overflow: 'hidden',
+  },
+  audioProgress: {
+    height: '100%',
+  },
+  audioDuration: {
+    fontSize: 12,
+    fontWeight: '500',
   },
 });
 

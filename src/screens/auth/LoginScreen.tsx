@@ -20,6 +20,7 @@ import { useTheme } from '../../context/ThemeContext';
 import { useAuth } from '../../context/AuthContext';
 import { useModal } from '../../context/ModalContext';
 import { authService } from '../../services/api/authService';
+import { validatePhoneNumber, getPhoneValidationError } from '../../utils/validators';
 
 type LoginScreenNavigationProp = NativeStackNavigationProp<AuthStackParamList, 'Login'>;
 
@@ -51,8 +52,10 @@ const LoginScreen = () => {
   }, [fadeAnim, slideAnim]);
 
   const handleSendCode = async () => {
-    if (phoneNumber.trim().length < 10) {
-      showError('Invalid Input', 'Please enter a valid phone number');
+    const trimmedPhone = phoneNumber.trim();
+    const phoneError = getPhoneValidationError(trimmedPhone);
+    if (phoneError) {
+      showError('Invalid Input', phoneError);
       return;
     }
 
@@ -60,10 +63,10 @@ const LoginScreen = () => {
 
     try {
       // Send verification code for login
-      await authService.sendVerificationCode(phoneNumber);
+      await authService.sendVerificationCode(trimmedPhone);
 
       // Navigate to Verification screen with login mode
-      navigation.navigate('Verification', { phoneNumber, mode: 'login' });
+      navigation.navigate('Verification', { phoneNumber: trimmedPhone, mode: 'login' });
     } catch (error: any) {
       console.error('Send code error:', error);
       showError('Error', error.message || 'Failed to send verification code. Please try again.');
@@ -72,7 +75,7 @@ const LoginScreen = () => {
     }
   };
 
-  const isFormValid = phoneNumber.trim().length >= 10;
+  const isFormValid = validatePhoneNumber(phoneNumber);
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>

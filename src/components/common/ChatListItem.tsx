@@ -39,14 +39,34 @@ const ChatListItem: React.FC<ChatListItemProps> = ({
   const formatTimestamp = (time?: string | Date): string => {
     if (!time) return '';
 
-    const date = typeof time === 'string' ? new Date(time) : time;
+    // Parse date as UTC if it doesn't have timezone info
+    let date: Date;
+    if (typeof time === 'string') {
+      // If the string doesn't end with Z or timezone offset, treat it as UTC
+      if (!time.endsWith('Z') && !time.match(/[+-]\d{2}:\d{2}$/)) {
+        date = new Date(time + 'Z');
+      } else {
+        date = new Date(time);
+      }
+    } else {
+      date = time;
+    }
+
+    // Handle invalid date
+    if (isNaN(date.getTime())) return '';
+
     const now = new Date();
     const diff = now.getTime() - date.getTime();
+    const diffMins = Math.floor(diff / (1000 * 60));
+    const diffHours = Math.floor(diff / (1000 * 60 * 60));
     const diffDays = Math.floor(diff / (1000 * 60 * 60 * 24));
 
-    if (diffDays === 0) {
-      // Today - show time
-      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (diffMins < 1) {
+      return 'Just now';
+    } else if (diffMins < 60) {
+      return `${diffMins}m ago`;
+    } else if (diffHours < 24) {
+      return `${diffHours}h ago`;
     } else if (diffDays === 1) {
       return 'Yesterday';
     } else if (diffDays < 7) {

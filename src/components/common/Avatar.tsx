@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Image, Text, StyleSheet, ViewStyle, ImageSourcePropType } from 'react-native';
+import { View, Image, Text, StyleSheet, ViewStyle, ImageStyle, ImageSourcePropType } from 'react-native';
 import { useTheme } from '../../context/ThemeContext';
 import { Theme } from '../../constants/theme';
 
@@ -46,7 +46,7 @@ const Avatar: React.FC<AvatarProps> = ({
     square: 0,
   };
 
-  const avatarStyle: ViewStyle = {
+  const avatarStyle: ViewStyle & ImageStyle = {
     width: size,
     height: size,
     borderRadius: borderRadiusMap[shape],
